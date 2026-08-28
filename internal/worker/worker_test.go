@@ -68,9 +68,9 @@ type mockIdempotencyStore struct {
 	claimBlocked map[string]bool
 
 	// Tracking fields (inspected in assertions).
-	claimAttempted  []string
-	releasedKeys    []string
-	markedDoneKeys  []string
+	claimAttempted []string
+	releasedKeys   []string
+	markedDoneKeys []string
 }
 
 func newMockIdempotencyStore() *mockIdempotencyStore {
