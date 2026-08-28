@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/Krishiv-Mahajan/LogMorph/internal/buffer"
@@ -26,14 +27,14 @@ type PipelineResult struct {
 
 // Worker coordinates raw event consumption, immutable storage, and the processing pipeline.
 type Worker struct {
-	buffer       buffer.RawBuffer
-	idempotency  buffer.IdempotencyStore
-	rawStore     raw.RawEventStore
-	detector     detection.Detector
+	buffer        buffer.RawBuffer
+	idempotency   buffer.IdempotencyStore
+	rawStore      raw.RawEventStore
+	detector      detection.Detector
 	driftDetector detection.DriftDetector
-	parserEngine parsing.Engine
-	normalizer   *normalization.Normalizer
-	validator    validation.Validator
+	parserEngine  parsing.Engine
+	normalizer    *normalization.Normalizer
+	validator     validation.Validator
 
 	streamName   string
 	groupName    string
@@ -54,6 +55,10 @@ type Worker struct {
 	// batchSize is the maximum number of messages fetched per ReadGroup /
 	// ClaimPending call. Configurable via WORKER_BATCH_SIZE (default 10).
 	batchSize int64
+
+	// concurrency is the maximum number of events processed in parallel within
+	// a batch. Configurable via WORKER_CONCURRENCY (default 4).
+	concurrency int64
 }
 
 // Config provides configuration options for the worker.
@@ -78,12 +83,17 @@ type Config struct {
 	// BatchSize is the maximum number of messages fetched per ReadGroup /
 	// ClaimPending call. Default: 10.
 	BatchSize int64
+
+	// Concurrency is the maximum number of messages processed in parallel.
+	// Default: 4.
+	Concurrency int64
 }
 
 const (
 	defaultLockTTLSeconds = 120
 	defaultDoneTTLSeconds = 86400
 	defaultBatchSize      = 10
+	defaultConcurrency    = 4
 )
 
 // NewWorker initialises a processing worker.
@@ -110,14 +120,17 @@ func NewWorker(
 	if cfg.ConsumerName == "" {
 		cfg.ConsumerName = "worker-1"
 	}
-	if cfg.LockTTLSeconds == 0 {
+	if cfg.LockTTLSeconds <= 0 {
 		cfg.LockTTLSeconds = defaultLockTTLSeconds
 	}
-	if cfg.DoneTTLSeconds == 0 {
+	if cfg.DoneTTLSeconds <= 0 {
 		cfg.DoneTTLSeconds = defaultDoneTTLSeconds
 	}
-	if cfg.BatchSize == 0 {
+	if cfg.BatchSize <= 0 {
 		cfg.BatchSize = defaultBatchSize
+	}
+	if cfg.Concurrency <= 0 {
+		cfg.Concurrency = defaultConcurrency
 	}
 
 	w := &Worker{
@@ -135,6 +148,7 @@ func NewWorker(
 		lockTTL:       time.Duration(cfg.LockTTLSeconds) * time.Second,
 		doneTTL:       time.Duration(cfg.DoneTTLSeconds) * time.Second,
 		batchSize:     cfg.BatchSize,
+		concurrency:   cfg.Concurrency,
 	}
 
 	if cfg.ClaimIdleMs > 0 {
@@ -233,8 +247,8 @@ func (w *Worker) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to ensure consumer group: %w", err)
 	}
 
-	log.Printf("[Worker] Listening on stream %q (group: %q, consumer: %q, batch: %d)",
-		w.streamName, w.groupName, w.consumerName, w.batchSize)
+	log.Printf("[Worker] Listening on stream %q (group: %q, consumer: %q, batch: %d, concurrency: %d)",
+		w.streamName, w.groupName, w.consumerName, w.batchSize, w.concurrency)
 
 	// Schedule the first pending-message reclaim check.
 	var nextClaimAt time.Time
@@ -286,13 +300,47 @@ func (w *Worker) Start(ctx context.Context) error {
 }
 
 // processMessages routes each message through idempotency-aware processing.
+// When concurrency > 1, messages are processed in parallel bounded by a semaphore pool.
 func (w *Worker) processMessages(ctx context.Context, messages []buffer.RawMessage) {
+	if len(messages) == 0 {
+		return
+	}
+
+	if w.concurrency <= 1 {
+		for _, msg := range messages {
+			if ctx.Err() != nil {
+				return
+			}
+			w.processSingleMessageIdempotent(ctx, msg)
+		}
+		return
+	}
+
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, w.concurrency)
+
 	for _, msg := range messages {
 		if ctx.Err() != nil {
-			return
+			break
 		}
-		w.processSingleMessageIdempotent(ctx, msg)
+
+		select {
+		case <-ctx.Done():
+			break
+		case sem <- struct{}{}:
+		}
+
+		wg.Add(1)
+		go func(m buffer.RawMessage) {
+			defer func() {
+				<-sem
+				wg.Done()
+			}()
+			w.processSingleMessageIdempotent(ctx, m)
+		}(msg)
 	}
+
+	wg.Wait()
 }
 
 // processSingleMessageIdempotent enforces at-most-once processing semantics on

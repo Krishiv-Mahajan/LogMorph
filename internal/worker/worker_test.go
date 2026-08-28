@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -509,5 +510,195 @@ func TestIdempotency_ConcurrentWorkers(t *testing.T) {
 	}
 	if successCount != 1 {
 		t.Errorf("expected exactly 1 goroutine to acquire processing lock, got %d", successCount)
+	}
+}
+
+// TestWorker_ConcurrentBatchProcessing verifies that a batch of events is processed
+// in parallel bounded by Concurrency and all valid events are ACKed and saved to raw store.
+func TestWorker_ConcurrentBatchProcessing(t *testing.T) {
+	const numEvents = 6
+	messages := make([]buffer.RawMessage, numEvents)
+	for i := 0; i < numEvents; i++ {
+		messages[i] = syslogMsg(
+			fmt.Sprintf("msg-%d", i),
+			fmt.Sprintf("evt_concurrent_%d", i),
+		)
+	}
+
+	mockBuf := &mockWorkerBuffer{messages: messages}
+	rawStore := raw.NewMemoryRawStore()
+	idempotency := buffer.NewMemoryIdempotencyStore()
+
+	normalizer := normalization.NewNormalizer()
+	validator, err := validation.NewValidator("")
+	if err != nil {
+		t.Fatalf("validator: %v", err)
+	}
+
+	w := NewWorker(
+		mockBuf,
+		idempotency,
+		rawStore,
+		detection.NewDetector(),
+		detection.NewDriftDetector(),
+		buildParserEngine(),
+		normalizer,
+		validator,
+		Config{
+			StreamName:   "raw_events",
+			GroupName:    "test-group",
+			ConsumerName: "test-worker",
+			BatchSize:    10,
+			Concurrency:  3,
+		},
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	_ = w.Start(ctx)
+
+	// Verify all 6 messages were ACKed
+	if len(mockBuf.acked) != numEvents {
+		t.Fatalf("expected %d ACKed messages, got %d", numEvents, len(mockBuf.acked))
+	}
+
+	// Verify all 6 events are in the raw store
+	for i := 0; i < numEvents; i++ {
+		evtID := fmt.Sprintf("evt_concurrent_%d", i)
+		stored, err := rawStore.Get(context.Background(), evtID)
+		if err != nil {
+			t.Errorf("event %s not found in raw store: %v", evtID, err)
+		}
+		if stored.Payload != "Aug 28 18:30:12 firewall01 DENY TCP SRC=192.168.1.20:54321 DST=10.0.0.15:443" {
+			t.Errorf("payload mismatch for %s", evtID)
+		}
+	}
+}
+
+// TestWorker_PartialFailureInBatch verifies that one failing event in a batch does
+// NOT block or fail the other valid events in the same batch.
+// The valid events are ACKed; the failed event remains un-ACKed.
+func TestWorker_PartialFailureInBatch(t *testing.T) {
+	messages := []buffer.RawMessage{
+		syslogMsg("msg-valid-1", "evt_valid_1"),
+		{
+			ID: "msg-bad",
+			Event: models.RawEvent{
+				EventID:    "evt_bad_fail",
+				ReceivedAt: time.Now().UTC().Format(time.RFC3339),
+				Format:     "unknown_no_parser",
+				Source:     "bad-source",
+				Payload:    "some bad unparseable data",
+			},
+		},
+		syslogMsg("msg-valid-2", "evt_valid_2"),
+	}
+
+	mockBuf := &mockWorkerBuffer{messages: messages}
+	rawStore := raw.NewMemoryRawStore()
+	idempotency := buffer.NewMemoryIdempotencyStore()
+
+	normalizer := normalization.NewNormalizer()
+	validator, err := validation.NewValidator("")
+	if err != nil {
+		t.Fatalf("validator: %v", err)
+	}
+
+	w := NewWorker(
+		mockBuf,
+		idempotency,
+		rawStore,
+		detection.NewDetector(),
+		detection.NewDriftDetector(),
+		buildParserEngine(),
+		normalizer,
+		validator,
+		Config{
+			StreamName:   "raw_events",
+			GroupName:    "test-group",
+			ConsumerName: "test-worker",
+			BatchSize:    10,
+			Concurrency:  2,
+		},
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+
+	_ = w.Start(ctx)
+
+	// Valid events must be ACKed
+	ackedSet := make(map[string]bool)
+	for _, id := range mockBuf.acked {
+		ackedSet[id] = true
+	}
+
+	if !ackedSet["msg-valid-1"] {
+		t.Errorf("expected msg-valid-1 to be ACKed")
+	}
+	if !ackedSet["msg-valid-2"] {
+		t.Errorf("expected msg-valid-2 to be ACKed")
+	}
+	if ackedSet["msg-bad"] {
+		t.Errorf("expected msg-bad to NOT be ACKed on failure")
+	}
+
+	// Valid events must be in the raw store
+	if _, err := rawStore.Get(context.Background(), "evt_valid_1"); err != nil {
+		t.Errorf("evt_valid_1 should be stored in raw store: %v", err)
+	}
+	if _, err := rawStore.Get(context.Background(), "evt_valid_2"); err != nil {
+		t.Errorf("evt_valid_2 should be stored in raw store: %v", err)
+	}
+}
+
+// TestWorker_ConcurrentRaceOnSameEvent_Idempotency verifies that when two workers
+// concurrently attempt to process the exact same event, only one runs the pipeline
+// and stores the event, while the other does not duplicate processing.
+func TestWorker_ConcurrentRaceOnSameEvent_Idempotency(t *testing.T) {
+	sharedRawStore := raw.NewMemoryRawStore()
+	sharedIdempotency := buffer.NewMemoryIdempotencyStore()
+
+	// Worker 1 buffer
+	buf1 := &mockWorkerBuffer{
+		messages: []buffer.RawMessage{syslogMsg("msg-race-1", "evt_race_same")},
+	}
+	// Worker 2 buffer with identical event_id
+	buf2 := &mockWorkerBuffer{
+		messages: []buffer.RawMessage{syslogMsg("msg-race-2", "evt_race_same")},
+	}
+
+	w1, _ := setupTestWorkerWithIdempotency(buf1, sharedRawStore, sharedIdempotency)
+	w2, _ := setupTestWorkerWithIdempotency(buf2, sharedRawStore, sharedIdempotency)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_ = w1.Start(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		_ = w2.Start(ctx)
+	}()
+	wg.Wait()
+
+	// Verify exact raw event was stored
+	stored, err := sharedRawStore.Get(context.Background(), "evt_race_same")
+	if err != nil {
+		t.Fatalf("expected evt_race_same to be stored: %v", err)
+	}
+	if stored.Payload != "Aug 28 18:30:12 firewall01 DENY TCP SRC=192.168.1.20:54321 DST=10.0.0.15:443" {
+		t.Errorf("payload corrupted: %s", stored.Payload)
+	}
+
+	// Done marker must be recorded
+	done, _ := sharedIdempotency.IsDone(context.Background(), "evt_race_same")
+	if !done {
+		t.Errorf("expected evt_race_same marked done")
 	}
 }

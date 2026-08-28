@@ -35,6 +35,7 @@ func NewHandler(service Service) *Handler {
 
 // RegisterRoutes sets up HTTP routes on the given ServeMux.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("POST /ingest/batch", h.HandleIngestBatch)
 	mux.HandleFunc("POST /ingest", h.HandleIngest)
 	mux.HandleFunc("GET /health", h.HandleHealth)
 }
@@ -46,7 +47,7 @@ func (h *Handler) HandleHealth(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-// HandleIngest accepts raw log payloads and buffers them immediately into Redis.
+// HandleIngest accepts a single raw log payload and buffers it immediately into Redis.
 func (h *Handler) HandleIngest(w http.ResponseWriter, r *http.Request) {
 	var req IngestRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -82,6 +83,56 @@ func (h *Handler) HandleIngest(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(IngestResponse{
 		EventID: eventID,
 		Status:  "accepted",
+	})
+}
+
+// HandleIngestBatch accepts an array of raw log payloads and buffers all of them into Redis.
+func (h *Handler) HandleIngestBatch(w http.ResponseWriter, r *http.Request) {
+	var reqs []IngestRequest
+	if err := json.NewDecoder(r.Body).Decode(&reqs); err != nil {
+		h.writeJSONError(w, http.StatusBadRequest, ErrorResponse{
+			Status:  "bad_request",
+			Message: fmt.Sprintf("invalid JSON batch payload: %v", err),
+		})
+		return
+	}
+
+	if len(reqs) == 0 {
+		h.writeJSONError(w, http.StatusBadRequest, ErrorResponse{
+			Status:  "bad_request",
+			Message: "batch must not be empty",
+		})
+		return
+	}
+
+	for i, req := range reqs {
+		if req.Payload == "" {
+			h.writeJSONError(w, http.StatusBadRequest, ErrorResponse{
+				Status:  "bad_request",
+				Message: fmt.Sprintf("item at index %d has empty payload", i),
+			})
+			return
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	eventIDs, err := h.service.IngestBatch(ctx, reqs)
+	if err != nil {
+		h.writeJSONError(w, http.StatusInternalServerError, ErrorResponse{
+			Status:  "ingestion_error",
+			Message: err.Error(),
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(BatchIngestResponse{
+		Status:   "accepted",
+		Count:    len(eventIDs),
+		EventIDs: eventIDs,
 	})
 }
 

@@ -76,6 +76,9 @@ func main() {
 	// WORKER_BATCH_SIZE is the max count of messages to fetch per read/claim (default 10).
 	batchSize, _ := strconv.ParseInt(os.Getenv("WORKER_BATCH_SIZE"), 10, 64)
 
+	// WORKER_CONCURRENCY is the max number of events processed in parallel (default 4).
+	concurrency, _ := strconv.ParseInt(os.Getenv("WORKER_CONCURRENCY"), 10, 64)
+
 	log.Printf("[Worker] Initializing ULPF Processing Worker (Redis: %s, Stream: %s, Group: %s)...",
 		redisAddr, rawStream, groupName)
 
@@ -161,6 +164,7 @@ func main() {
 			LockTTLSeconds: lockTTL,
 			DoneTTLSeconds: doneTTL,
 			BatchSize:      batchSize,
+			Concurrency:    concurrency,
 		},
 	)
 
