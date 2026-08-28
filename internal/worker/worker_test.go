@@ -2,30 +2,33 @@ package worker
 
 import (
 	"context"
-	"encoding/json"
-	"sync/atomic"
 	"testing"
 	"time"
 
-	goredis "github.com/redis/go-redis/v9"
-
+	"github.com/Krishiv-Mahajan/LogMorph/internal/buffer"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/detection"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/models"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/normalization"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/parsing"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/parsing/parsers"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/raw"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/validation"
 )
 
-type mockWorkerStreamClient struct {
-	messages []goredis.XMessage
+type mockWorkerBuffer struct {
+	messages []buffer.RawMessage
 	acked    []string
 }
 
-func (m *mockWorkerStreamClient) PublishEvent(ctx context.Context, stream string, event *models.WorkerEvent) (string, error) {
+func (m *mockWorkerBuffer) PublishRaw(ctx context.Context, stream string, event *models.RawEvent) (string, error) {
 	return "mock_id", nil
 }
 
-func (m *mockWorkerStreamClient) EnsureConsumerGroup(ctx context.Context, stream string, group string) error {
+func (m *mockWorkerBuffer) EnsureGroup(ctx context.Context, stream string, group string) error {
 	return nil
 }
 
-func (m *mockWorkerStreamClient) ReadGroup(ctx context.Context, stream, group, consumer string, count int64, block time.Duration) ([]goredis.XMessage, error) {
+func (m *mockWorkerBuffer) ReadGroup(ctx context.Context, stream, group, consumer string, count int64, block time.Duration) ([]buffer.RawMessage, error) {
 	if len(m.messages) > 0 {
 		msgs := m.messages
 		m.messages = nil
@@ -35,68 +38,88 @@ func (m *mockWorkerStreamClient) ReadGroup(ctx context.Context, stream, group, c
 	return nil, nil
 }
 
-func (m *mockWorkerStreamClient) Ack(ctx context.Context, stream, group string, ids ...string) error {
+func (m *mockWorkerBuffer) Ack(ctx context.Context, stream, group string, ids ...string) error {
 	m.acked = append(m.acked, ids...)
 	return nil
 }
 
-func (m *mockWorkerStreamClient) Close() error {
+func (m *mockWorkerBuffer) Ping(ctx context.Context) error {
 	return nil
 }
 
-func (m *mockWorkerStreamClient) Ping(ctx context.Context) error {
+func (m *mockWorkerBuffer) Close() error {
 	return nil
 }
 
-func TestWorker_ProcessingLoop(t *testing.T) {
-	evt := models.WorkerEvent{
-		EventID:       "evt_worker_1",
-		SchemaVersion: "1.0",
-		Event: models.UniversalEvent{
-			EventID:       "evt_worker_1",
-			SchemaVersion: "1.0",
-			Timestamp:     "2026-08-28T18:30:12Z",
-			Event: models.EventInfo{
-				Action: "deny",
-			},
-			Raw: models.RawInfo{
-				Format:  "syslog",
-				Message: "raw log",
-			},
-		},
+func setupTestWorker(mockBuf *mockWorkerBuffer, rawStore raw.RawEventStore) (*Worker, error) {
+	detector := detection.NewDetector()
+	driftDetector := detection.NewDriftDetector()
+	registry := parsing.NewRegistry()
+	registry.Register(parsers.NewSyslogParser())
+	registry.Register(parsers.NewJSONParser())
+	registry.Register(parsers.NewCSVParser())
+	parserEngine := parsing.NewEngine(registry)
+	normalizer := normalization.NewNormalizer()
+	validator, err := validation.NewValidator("")
+	if err != nil {
+		return nil, err
 	}
-	payloadBytes, _ := json.Marshal(evt)
 
-	mockClient := &mockWorkerStreamClient{
-		messages: []goredis.XMessage{
+	w := NewWorker(
+		mockBuf,
+		rawStore,
+		detector,
+		driftDetector,
+		parserEngine,
+		normalizer,
+		validator,
+		Config{
+			StreamName:   "raw_events",
+			GroupName:    "test-group",
+			ConsumerName: "test-worker",
+		},
+	)
+	return w, nil
+}
+
+func TestWorker_FullPipelineAndStorage(t *testing.T) {
+	rawStore := raw.NewMemoryRawStore()
+	mockBuf := &mockWorkerBuffer{
+		messages: []buffer.RawMessage{
 			{
 				ID: "1670000000000-0",
-				Values: map[string]interface{}{
-					"payload": string(payloadBytes),
+				Event: models.RawEvent{
+					EventID:    "evt_test_syslog",
+					ReceivedAt: time.Now().UTC().Format(time.RFC3339),
+					Format:     "syslog",
+					Source:     "firewall-01",
+					Payload:    "Aug 28 18:30:12 firewall01 DENY TCP SRC=192.168.1.20:54321 DST=10.0.0.15:443",
 				},
 			},
 		},
 	}
 
-	var processedCount int32
-	worker := NewWorker(mockClient, Config{
-		ProcessFunc: func(ctx context.Context, event *models.WorkerEvent) error {
-			if event.EventID == "evt_worker_1" {
-				atomic.AddInt32(&processedCount, 1)
-			}
-			return nil
-		},
-	})
+	w, err := setupTestWorker(mockBuf, rawStore)
+	if err != nil {
+		t.Fatalf("failed to setup worker: %v", err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
-	_ = worker.Start(ctx)
+	_ = w.Start(ctx)
 
-	if atomic.LoadInt32(&processedCount) != 1 {
-		t.Errorf("expected 1 processed event, got %d", processedCount)
+	// 1. Verify Redis Message was acknowledged
+	if len(mockBuf.acked) != 1 || mockBuf.acked[0] != "1670000000000-0" {
+		t.Errorf("expected message acked, got: %v", mockBuf.acked)
 	}
-	if len(mockClient.acked) != 1 || mockClient.acked[0] != "1670000000000-0" {
-		t.Errorf("expected message to be acked, got: %v", mockClient.acked)
+
+	// 2. Verify Raw Event was stored immutably in RawEventStore
+	storedRaw, err := rawStore.Get(context.Background(), "evt_test_syslog")
+	if err != nil {
+		t.Fatalf("expected raw event stored in RawEventStore: %v", err)
+	}
+	if storedRaw.Payload != "Aug 28 18:30:12 firewall01 DENY TCP SRC=192.168.1.20:54321 DST=10.0.0.15:443" {
+		t.Errorf("stored raw payload mismatch: %s", storedRaw.Payload)
 	}
 }

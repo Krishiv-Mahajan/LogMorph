@@ -1,35 +1,20 @@
 package parsers
 
 import (
+	"context"
 	"testing"
 
 	"github.com/Krishiv-Mahajan/LogMorph/internal/models"
 )
 
-func TestJSONParser(t *testing.T) {
-	parser := NewJSONParser()
+func TestCSVParser(t *testing.T) {
+	parser := NewCSVParser()
 	raw := models.RawEvent{
-		Source: "custom-json-src",
-		Payload: `{
-			"timestamp": "2026-08-28T18:30:12Z",
-			"firewall": {
-				"action": "deny",
-				"protocol": "TCP"
-			},
-			"network": {
-				"source": {
-					"ip": "192.168.1.20",
-					"port": 54321
-				},
-				"destination": {
-					"ip": "10.0.0.15",
-					"port": 443
-				}
-			}
-		}`,
+		Source:  "csv-sensor",
+		Payload: "timestamp,action,protocol,src_ip,src_port,dst_ip,dst_port\n2026-08-28T18:30:12Z,deny,TCP,192.168.1.20,54321,10.0.0.15,443",
 	}
 
-	event, err := parser.Parse(raw)
+	event, err := parser.Parse(context.Background(), raw)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -55,7 +40,16 @@ func TestJSONParser(t *testing.T) {
 	if event.Network.DstPort == nil || *event.Network.DstPort != 443 {
 		t.Errorf("expected dst_port 443, got %v", event.Network.DstPort)
 	}
-	if event.Source.Identifier != "custom-json-src" {
-		t.Errorf("expected identifier 'custom-json-src', got %q", event.Source.Identifier)
+}
+
+func TestCSVParser_Malformed(t *testing.T) {
+	parser := NewCSVParser()
+	raw := models.RawEvent{
+		Payload: "timestamp,action\n2026-08-28T18:30:12Z,deny,extra_col",
+	}
+
+	_, err := parser.Parse(context.Background(), raw)
+	if err == nil {
+		t.Fatal("expected error on malformed CSV columns mismatch, got nil")
 	}
 }

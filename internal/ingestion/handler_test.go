@@ -9,67 +9,54 @@ import (
 	"testing"
 	"time"
 
-	goredis "github.com/redis/go-redis/v9"
-
-	"github.com/Krishiv-Mahajan/LogMorph/internal/detection"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/buffer"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/models"
-	"github.com/Krishiv-Mahajan/LogMorph/internal/normalization"
-	"github.com/Krishiv-Mahajan/LogMorph/internal/normalization/parsers"
-	"github.com/Krishiv-Mahajan/LogMorph/internal/validation"
 )
 
-type mockStreamClient struct {
-	published []*models.WorkerEvent
+type mockRawBuffer struct {
+	published []*models.RawEvent
 }
 
-func (m *mockStreamClient) PublishEvent(ctx context.Context, stream string, event *models.WorkerEvent) (string, error) {
+func (m *mockRawBuffer) PublishRaw(ctx context.Context, stream string, event *models.RawEvent) (string, error) {
 	m.published = append(m.published, event)
-	return "mock_1", nil
+	return "mock_raw_msg_1", nil
 }
 
-func (m *mockStreamClient) EnsureConsumerGroup(ctx context.Context, stream string, group string) error {
+func (m *mockRawBuffer) EnsureGroup(ctx context.Context, stream string, group string) error {
 	return nil
 }
 
-func (m *mockStreamClient) ReadGroup(ctx context.Context, stream, group, consumer string, count int64, block time.Duration) ([]goredis.XMessage, error) {
+func (m *mockRawBuffer) ReadGroup(ctx context.Context, stream, group, consumer string, count int64, block time.Duration) ([]buffer.RawMessage, error) {
 	return nil, nil
 }
 
-func (m *mockStreamClient) Ack(ctx context.Context, stream, group string, ids ...string) error {
+func (m *mockRawBuffer) Ack(ctx context.Context, stream, group string, ids ...string) error {
 	return nil
 }
 
-func (m *mockStreamClient) Close() error {
+func (m *mockRawBuffer) Ping(ctx context.Context) error {
 	return nil
 }
 
-func (m *mockStreamClient) Ping(ctx context.Context) error {
+func (m *mockRawBuffer) Close() error {
 	return nil
 }
 
 func TestHandler_IngestAndHealth(t *testing.T) {
-	detector := detection.NewDetector()
-	registry := normalization.NewRegistry()
-	registry.Register(parsers.NewSyslogParser())
-	normalizer := normalization.NewNormalizer(detector, registry)
-	validator, err := validation.NewValidator("")
-	if err != nil {
-		t.Fatalf("failed to create validator: %v", err)
-	}
+	mockBuf := &mockRawBuffer{}
+	service := NewService(mockBuf, "raw_events")
+	handler := NewHandler(service)
 
-	mockStream := &mockStreamClient{}
-	handler := NewHandler(normalizer, validator, mockStream, "normalized_events")
-
-	// Health check test
+	// Test GET /health
 	recHealth := httptest.NewRecorder()
 	reqHealth := httptest.NewRequest(http.MethodGet, "/health", nil)
 	handler.HandleHealth(recHealth, reqHealth)
 	if recHealth.Code != http.StatusOK {
-		t.Errorf("expected 200 OK for /health, got %d", recHealth.Code)
+		t.Errorf("expected 200 OK, got %d", recHealth.Code)
 	}
 
-	// Ingest test
-	body := `{"payload": "Aug 28 18:30:12 firewall01 DENY TCP SRC=192.168.1.20:54321 DST=10.0.0.15:443"}`
+	// Test POST /ingest
+	body := `{"format":"syslog","source":"firewall-01","payload":"Aug 28 18:30:12 firewall01 DENY TCP SRC=192.168.1.20:54321 DST=10.0.0.15:443"}`
 	recIngest := httptest.NewRecorder()
 	reqIngest := httptest.NewRequest(http.MethodPost, "/ingest", bytes.NewBufferString(body))
 	handler.HandleIngest(recIngest, reqIngest)
@@ -85,17 +72,21 @@ func TestHandler_IngestAndHealth(t *testing.T) {
 	if resp.EventID == "" || resp.Status != "accepted" {
 		t.Errorf("unexpected response: %+v", resp)
 	}
+
+	if len(mockBuf.published) != 1 {
+		t.Fatalf("expected 1 published raw event, got %d", len(mockBuf.published))
+	}
+	if mockBuf.published[0].Payload != "Aug 28 18:30:12 firewall01 DENY TCP SRC=192.168.1.20:54321 DST=10.0.0.15:443" {
+		t.Errorf("payload corrupted during ingestion: %s", mockBuf.published[0].Payload)
+	}
 }
 
 func TestHandler_EmptyPayload(t *testing.T) {
-	detector := detection.NewDetector()
-	registry := normalization.NewRegistry()
-	normalizer := normalization.NewNormalizer(detector, registry)
-	validator, _ := validation.NewValidator("")
+	service := NewService(nil, "")
+	handler := NewHandler(service)
 
-	handler := NewHandler(normalizer, validator, nil, "")
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/ingest", bytes.NewBufferString(`{"payload": ""}`))
+	req := httptest.NewRequest(http.MethodPost, "/ingest", bytes.NewBufferString(`{"payload":""}`))
 	handler.HandleIngest(rec, req)
 
 	if rec.Code != http.StatusBadRequest {

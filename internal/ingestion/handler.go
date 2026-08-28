@@ -6,54 +6,30 @@ import (
 	"fmt"
 	"net/http"
 	"time"
-
-	"github.com/google/uuid"
-
-	"github.com/Krishiv-Mahajan/LogMorph/internal/models"
-	"github.com/Krishiv-Mahajan/LogMorph/internal/normalization"
-	"github.com/Krishiv-Mahajan/LogMorph/internal/redis"
-	"github.com/Krishiv-Mahajan/LogMorph/internal/validation"
 )
 
-// IngestRequest represents the HTTP request payload for /ingest.
-type IngestRequest struct {
-	Format  string `json:"format,omitempty"`
-	Source  string `json:"source,omitempty"`
-	Payload string `json:"payload"`
-}
-
-// IngestResponse is returned on successful ingestion.
+// IngestResponse is returned on successful event acceptance into the raw buffer.
 type IngestResponse struct {
 	EventID string `json:"event_id"`
 	Status  string `json:"status"`
 }
 
-// ErrorResponse is returned when ingestion or validation fails.
+// ErrorResponse is returned when request validation or buffering fails.
 type ErrorResponse struct {
-	EventID string                       `json:"event_id,omitempty"`
-	Status  string                       `json:"status"`
-	Message string                       `json:"message,omitempty"`
-	Errors  []validation.ValidationError `json:"errors,omitempty"`
+	EventID string `json:"event_id,omitempty"`
+	Status  string `json:"status"`
+	Message string `json:"message"`
 }
 
-// Handler coordinates HTTP ingestion, normalization, validation, and Redis publication.
+// Handler handles HTTP requests for log ingestion.
 type Handler struct {
-	normalizer *normalization.Normalizer
-	validator  validation.Validator
-	publisher  redis.StreamClient
-	streamName string
+	service Service
 }
 
 // NewHandler creates a new Ingestion HTTP handler.
-func NewHandler(normalizer *normalization.Normalizer, validator validation.Validator, publisher redis.StreamClient, streamName string) *Handler {
-	if streamName == "" {
-		streamName = redis.DefaultStreamName
-	}
+func NewHandler(service Service) *Handler {
 	return &Handler{
-		normalizer: normalizer,
-		validator:  validator,
-		publisher:  publisher,
-		streamName: streamName,
+		service: service,
 	}
 }
 
@@ -70,7 +46,7 @@ func (h *Handler) HandleHealth(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
-// HandleIngest processes raw logs, normalizes, validates, and sends to Redis Stream.
+// HandleIngest accepts raw log payloads and buffers them immediately into Redis.
 func (h *Handler) HandleIngest(w http.ResponseWriter, r *http.Request) {
 	var req IngestRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -89,68 +65,22 @@ func (h *Handler) HandleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	eventID := fmt.Sprintf("evt_%s", uuid.New().String())
-	rawEvent := models.RawEvent{
-		EventID:    eventID,
-		ReceivedAt: time.Now().UTC().Format(time.RFC3339),
-		Format:     req.Format,
-		Source:     req.Source,
-		Payload:    req.Payload,
-	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
 
-	// 1. Normalization
-	universalEvent, err := h.normalizer.Normalize(rawEvent)
+	eventID, err := h.service.Ingest(ctx, req)
 	if err != nil {
-		h.writeJSONError(w, http.StatusUnprocessableEntity, ErrorResponse{
-			EventID: eventID,
-			Status:  "normalization_error",
+		h.writeJSONError(w, http.StatusInternalServerError, ErrorResponse{
+			Status:  "ingestion_error",
 			Message: err.Error(),
 		})
 		return
 	}
 
-	// 2. Validation
-	valResult := h.validator.Validate(universalEvent)
-	if !valResult.Valid {
-		h.writeJSONError(w, http.StatusUnprocessableEntity, ErrorResponse{
-			EventID: universalEvent.EventID,
-			Status:  "validation_failed",
-			Message: "event failed JSON schema validation",
-			Errors:  valResult.Errors,
-		})
-		return
-	}
-
-	// 3. Publish to Redis Stream
-	workerEvent := &models.WorkerEvent{
-		EventID:       universalEvent.EventID,
-		SchemaVersion: universalEvent.SchemaVersion,
-		Event:         *universalEvent,
-		Metadata: map[string]any{
-			"published_at": time.Now().UTC().Format(time.RFC3339),
-			"stream_name":  h.streamName,
-		},
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-
-	if h.publisher != nil {
-		if _, err := h.publisher.PublishEvent(ctx, h.streamName, workerEvent); err != nil {
-			h.writeJSONError(w, http.StatusInternalServerError, ErrorResponse{
-				EventID: universalEvent.EventID,
-				Status:  "publish_error",
-				Message: fmt.Sprintf("failed to publish to Redis stream: %v", err),
-			})
-			return
-		}
-	}
-
-	// 4. Success Response
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(IngestResponse{
-		EventID: universalEvent.EventID,
+		EventID: eventID,
 		Status:  "accepted",
 	})
 }

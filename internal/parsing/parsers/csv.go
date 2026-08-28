@@ -2,6 +2,7 @@ package parsers
 
 import (
 	"bytes"
+	"context"
 	"encoding/csv"
 	"fmt"
 	"strconv"
@@ -11,18 +12,18 @@ import (
 	"github.com/Krishiv-Mahajan/LogMorph/internal/models"
 )
 
-// CSVParser parses CSV security/network records.
+// CSVParser parses CSV security/network records into a ParsedEvent.
 type CSVParser struct{}
 
 func NewCSVParser() *CSVParser {
 	return &CSVParser{}
 }
 
-func (p *CSVParser) Name() string {
+func (p *CSVParser) Format() string {
 	return "csv"
 }
 
-func (p *CSVParser) Parse(raw models.RawEvent) (*models.UniversalEvent, error) {
+func (p *CSVParser) Parse(ctx context.Context, raw models.RawEvent) (*models.ParsedEvent, error) {
 	trimmed := strings.TrimSpace(raw.Payload)
 	if trimmed == "" {
 		return nil, fmt.Errorf("empty CSV payload")
@@ -40,7 +41,7 @@ func (p *CSVParser) Parse(raw models.RawEvent) (*models.UniversalEvent, error) {
 	}
 
 	header := records[0]
-	row := records[1] // Use first data record for event normalization
+	row := records[1]
 
 	if len(header) != len(row) {
 		return nil, fmt.Errorf("header column count (%d) does not match data row column count (%d)", len(header), len(row))
@@ -114,9 +115,8 @@ func (p *CSVParser) Parse(raw models.RawEvent) (*models.UniversalEvent, error) {
 		user = &models.UserInfo{Username: nil}
 	}
 
-	return &models.UniversalEvent{
-		SchemaVersion: "1.0",
-		Timestamp:     ts,
+	return &models.ParsedEvent{
+		Timestamp: ts,
 		Source: models.SourceInfo{
 			Type:       "firewall",
 			Vendor:     "generic",
@@ -130,12 +130,5 @@ func (p *CSVParser) Parse(raw models.RawEvent) (*models.UniversalEvent, error) {
 		},
 		Network: netInfo,
 		User:    user,
-		Raw: models.RawInfo{
-			Format:  "csv",
-			Message: raw.Payload,
-		},
-		Metadata: models.MetadataInfo{
-			ParserVersion: "1.0",
-		},
 	}, nil
 }

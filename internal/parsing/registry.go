@@ -1,4 +1,4 @@
-package normalization
+package parsing
 
 import (
 	"fmt"
@@ -11,7 +11,7 @@ type Registry struct {
 	mu      sync.RWMutex
 }
 
-// NewRegistry creates an empty parser registry.
+// NewRegistry creates a new parser registry.
 func NewRegistry() *Registry {
 	return &Registry{
 		parsers: make(map[string]Parser),
@@ -22,7 +22,7 @@ func NewRegistry() *Registry {
 func (r *Registry) Register(parser Parser) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.parsers[parser.Name()] = parser
+	r.parsers[parser.Format()] = parser
 }
 
 // Get retrieves a parser by format name.

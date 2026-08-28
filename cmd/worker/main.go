@@ -8,7 +8,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Krishiv-Mahajan/LogMorph/internal/redis"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/buffer"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/detection"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/normalization"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/parsing"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/parsing/parsers"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/raw"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/validation"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/worker"
 )
 
@@ -18,47 +24,118 @@ func main() {
 		redisAddr = "localhost:6379"
 	}
 	redisPassword := os.Getenv("REDIS_PASSWORD")
-	streamName := os.Getenv("STREAM_NAME")
-	if streamName == "" {
-		streamName = redis.DefaultStreamName
+
+	rawStream := os.Getenv("RAW_STREAM_NAME")
+	if rawStream == "" {
+		rawStream = buffer.DefaultRawStreamName
 	}
 	groupName := os.Getenv("CONSUMER_GROUP")
 	if groupName == "" {
-		groupName = redis.DefaultGroupName
+		groupName = buffer.DefaultGroupName
 	}
 	consumerName := os.Getenv("CONSUMER_NAME")
 	if consumerName == "" {
 		consumerName = "worker-1"
 	}
 
-	log.Printf("[Worker] Initializing ULPF Worker (Redis: %s, Stream: %s, Group: %s)...",
-		redisAddr, streamName, groupName)
-
-	redisClient, err := redis.NewStreamClient(redisAddr, redisPassword, 0)
-	if err != nil {
-		log.Fatalf("[Worker] Failed to create Redis client: %v", err)
+	minioEndpoint := os.Getenv("MINIO_ENDPOINT")
+	if minioEndpoint == "" {
+		minioEndpoint = "localhost:9000"
 	}
-	defer redisClient.Close()
+	minioAccessKey := os.Getenv("MINIO_ACCESS_KEY")
+	if minioAccessKey == "" {
+		minioAccessKey = "minioadmin"
+	}
+	minioSecretKey := os.Getenv("MINIO_SECRET_KEY")
+	if minioSecretKey == "" {
+		minioSecretKey = "minioadminpassword"
+	}
+	minioBucket := os.Getenv("MINIO_BUCKET")
+	if minioBucket == "" {
+		minioBucket = "raw-events"
+	}
+	minioUseSSL := os.Getenv("MINIO_USE_SSL") == "true"
 
-	// Wait for Redis to be ready
+	log.Printf("[Worker] Initializing ULPF Processing Worker (Redis: %s, Stream: %s, Group: %s)...",
+		redisAddr, rawStream, groupName)
+
+	// 1. Redis Raw Stream Buffer
+	rawBuffer, err := buffer.NewRedisRawBuffer(redisAddr, redisPassword, 0)
+	if err != nil {
+		log.Fatalf("[Worker] Failed to create Redis buffer client: %v", err)
+	}
+	defer rawBuffer.Close()
+
+	// Wait for Redis connection
 	for {
 		ctxPing, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		if err := redisClient.Ping(ctxPing); err == nil {
+		if err := rawBuffer.Ping(ctxPing); err == nil {
 			cancel()
-			log.Println("[Worker] Successfully connected to Redis")
+			log.Println("[Worker] Connected to Redis")
 			break
 		} else {
 			cancel()
-			log.Printf("[Worker] Waiting for Redis at %s (%v)...", redisAddr, err)
+			log.Printf("[Worker] Waiting for Redis at %s...", redisAddr)
 			time.Sleep(2 * time.Second)
 		}
 	}
 
-	w := worker.NewWorker(redisClient, worker.Config{
-		StreamName:   streamName,
-		GroupName:    groupName,
-		ConsumerName: consumerName,
+	// 2. Immutable Raw Event Store (MinIO with Memory fallback)
+	ctxMinio, cancelMinio := context.WithTimeout(context.Background(), 5*time.Second)
+	var rawStore raw.RawEventStore
+	minioStore, err := raw.NewMinIORawStore(ctxMinio, raw.MinIOConfig{
+		Endpoint:        minioEndpoint,
+		AccessKeyID:     minioAccessKey,
+		SecretAccessKey: minioSecretKey,
+		BucketName:      minioBucket,
+		UseSSL:          minioUseSSL,
 	})
+	cancelMinio()
+
+	if err != nil {
+		log.Printf("[Worker] Warning: MinIO unavailable at %s (%v). Using in-memory raw store fallback.", minioEndpoint, err)
+		rawStore = raw.NewMemoryRawStore()
+	} else {
+		log.Printf("[Worker] Connected to MinIO raw store (bucket: %s) at %s", minioBucket, minioEndpoint)
+		rawStore = minioStore
+	}
+	defer rawStore.Close()
+
+	// 3. Detection & Drift
+	detector := detection.NewDetector()
+	driftDetector := detection.NewDriftDetector()
+
+	// 4. Parser Engine & Registry
+	registry := parsing.NewRegistry()
+	registry.Register(parsers.NewSyslogParser())
+	registry.Register(parsers.NewJSONParser())
+	registry.Register(parsers.NewCSVParser())
+	parserEngine := parsing.NewEngine(registry)
+
+	// 5. Normalizer
+	normalizer := normalization.NewNormalizer()
+
+	// 6. JSON Schema Validator
+	validator, err := validation.NewValidator("")
+	if err != nil {
+		log.Fatalf("[Worker] Failed to initialize JSON Schema validator: %v", err)
+	}
+
+	// 7. Worker Instance
+	w := worker.NewWorker(
+		rawBuffer,
+		rawStore,
+		detector,
+		driftDetector,
+		parserEngine,
+		normalizer,
+		validator,
+		worker.Config{
+			StreamName:   rawStream,
+			GroupName:    groupName,
+			ConsumerName: consumerName,
+		},
+	)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -73,7 +150,7 @@ func main() {
 	}()
 
 	if err := w.Start(ctx); err != nil {
-		log.Printf("[Worker] Worker exited with error: %v", err)
+		log.Printf("[Worker] Exited with error: %v", err)
 	}
 	log.Println("[Worker] Worker stopped")
 }

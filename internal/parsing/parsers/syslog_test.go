@@ -1,26 +1,24 @@
 package parsers
 
 import (
+	"context"
 	"testing"
 
 	"github.com/Krishiv-Mahajan/LogMorph/internal/models"
 )
 
-func TestCSVParser(t *testing.T) {
-	parser := NewCSVParser()
+func TestSyslogParser(t *testing.T) {
+	parser := NewSyslogParser()
 	raw := models.RawEvent{
-		Source:  "csv-sensor",
-		Payload: "timestamp,action,protocol,src_ip,src_port,dst_ip,dst_port\n2026-08-28T18:30:12Z,deny,TCP,192.168.1.20,54321,10.0.0.15,443",
+		Source:  "firewall01",
+		Payload: "Aug 28 18:30:12 firewall01 DENY TCP SRC=192.168.1.20:54321 DST=10.0.0.15:443",
 	}
 
-	event, err := parser.Parse(raw)
+	event, err := parser.Parse(context.Background(), raw)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if event.Timestamp != "2026-08-28T18:30:12Z" {
-		t.Errorf("expected timestamp '2026-08-28T18:30:12Z', got %q", event.Timestamp)
-	}
 	if event.Event.Action != "deny" {
 		t.Errorf("expected action 'deny', got %q", event.Event.Action)
 	}
@@ -39,16 +37,7 @@ func TestCSVParser(t *testing.T) {
 	if event.Network.DstPort == nil || *event.Network.DstPort != 443 {
 		t.Errorf("expected dst_port 443, got %v", event.Network.DstPort)
 	}
-}
-
-func TestCSVParser_Malformed(t *testing.T) {
-	parser := NewCSVParser()
-	raw := models.RawEvent{
-		Payload: "timestamp,action\n2026-08-28T18:30:12Z,deny,extra_col",
-	}
-
-	_, err := parser.Parse(raw)
-	if err == nil {
-		t.Fatal("expected error on malformed CSV columns mismatch, got nil")
+	if event.Source.Identifier != "firewall01" {
+		t.Errorf("expected source identifier 'firewall01', got %q", event.Source.Identifier)
 	}
 }

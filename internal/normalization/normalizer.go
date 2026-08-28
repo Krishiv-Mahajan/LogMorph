@@ -6,66 +6,59 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/Krishiv-Mahajan/LogMorph/internal/detection"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/models"
 )
 
-// Normalizer orchestrates detection, parser selection, and canonical field assignment.
-type Normalizer struct {
-	detector detection.Detector
-	registry *Registry
-}
+// Normalizer transforms structured ParsedEvents into canonical UniversalEvents (Schema v1.0).
+type Normalizer struct{}
 
 // NewNormalizer creates a new Normalizer instance.
-func NewNormalizer(detector detection.Detector, registry *Registry) *Normalizer {
-	return &Normalizer{
-		detector: detector,
-		registry: registry,
-	}
+func NewNormalizer() *Normalizer {
+	return &Normalizer{}
 }
 
-// Normalize processes a RawEvent into a normalized UniversalEvent.
-func (n *Normalizer) Normalize(raw models.RawEvent) (*models.UniversalEvent, error) {
-	// 1. Detect format
-	detectResult := n.detector.Detect(raw.Payload, raw.Format)
-	if detectResult.Format == detection.FormatUnknown {
-		return nil, fmt.Errorf("format detection failed: %s", detectResult.Reason)
+// Normalize combines raw log metadata and parsed fields into a canonical UniversalEvent.
+func (n *Normalizer) Normalize(raw models.RawEvent, parsed *models.ParsedEvent, detection models.DetectionResult) (*models.UniversalEvent, error) {
+	if parsed == nil {
+		return nil, fmt.Errorf("cannot normalize nil parsed event")
 	}
 
-	// 2. Select parser
-	parser, err := n.registry.Get(detectResult.Format)
-	if err != nil {
-		return nil, fmt.Errorf("parser lookup failed: %w", err)
+	eventID := raw.EventID
+	if eventID == "" {
+		eventID = fmt.Sprintf("evt_%s", uuid.New().String())
 	}
 
-	// 3. Parse raw payload
-	event, err := parser.Parse(raw)
-	if err != nil {
-		return nil, fmt.Errorf("parsing failed (%s): %w", detectResult.Format, err)
+	ts := parsed.Timestamp
+	if ts == "" {
+		ts = raw.ReceivedAt
+	}
+	if ts == "" {
+		ts = time.Now().UTC().Format(time.RFC3339)
 	}
 
-	// 4. Canonical field enrichment
-	if raw.EventID != "" {
-		event.EventID = raw.EventID
-	} else if event.EventID == "" {
-		event.EventID = fmt.Sprintf("evt_%s", uuid.New().String())
+	format := detection.Format
+	if format == "" {
+		format = raw.Format
+	}
+	if format == "" {
+		format = "unknown"
 	}
 
-	event.SchemaVersion = "1.0"
-
-	if event.Timestamp == "" {
-		event.Timestamp = time.Now().UTC().Format(time.RFC3339)
-	}
-
-	event.Raw.Format = detectResult.Format
-	if event.Raw.Message == "" {
-		event.Raw.Message = raw.Payload
-	}
-
-	if event.Metadata.ParserVersion == "" {
-		event.Metadata.ParserVersion = "1.0"
-	}
-	event.Metadata.IngestedAt = time.Now().UTC().Format(time.RFC3339)
-
-	return event, nil
+	return &models.UniversalEvent{
+		EventID:       eventID,
+		SchemaVersion: "1.0",
+		Timestamp:     ts,
+		Source:        parsed.Source,
+		Event:         parsed.Event,
+		Network:       parsed.Network,
+		User:          parsed.User,
+		Raw: models.RawInfo{
+			Format:  format,
+			Message: raw.Payload,
+		},
+		Metadata: models.MetadataInfo{
+			ParserVersion: "1.0",
+			IngestedAt:    time.Now().UTC().Format(time.RFC3339),
+		},
+	}, nil
 }

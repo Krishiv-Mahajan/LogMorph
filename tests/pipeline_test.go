@@ -10,69 +10,94 @@ import (
 	"testing"
 	"time"
 
-	goredis "github.com/redis/go-redis/v9"
-
+	"github.com/Krishiv-Mahajan/LogMorph/internal/buffer"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/detection"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/ingestion"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/models"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/normalization"
-	"github.com/Krishiv-Mahajan/LogMorph/internal/normalization/parsers"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/parsing"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/parsing/parsers"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/raw"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/validation"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/worker"
 )
 
-// mockStreamClient captures published events in-memory for testing
-type mockStreamClient struct {
-	published []*models.WorkerEvent
+type inMemoryBuffer struct {
+	messages []buffer.RawMessage
+	acked    []string
 }
 
-func (m *mockStreamClient) PublishEvent(ctx context.Context, stream string, event *models.WorkerEvent) (string, error) {
-	m.published = append(m.published, event)
-	return "mock_msg_1", nil
+func (b *inMemoryBuffer) PublishRaw(ctx context.Context, stream string, event *models.RawEvent) (string, error) {
+	id := "msg_1"
+	b.messages = append(b.messages, buffer.RawMessage{
+		ID:    id,
+		Event: *event,
+	})
+	return id, nil
 }
 
-func (m *mockStreamClient) EnsureConsumerGroup(ctx context.Context, stream string, group string) error {
+func (b *inMemoryBuffer) EnsureGroup(ctx context.Context, stream string, group string) error {
 	return nil
 }
 
-func (m *mockStreamClient) ReadGroup(ctx context.Context, stream, group, consumer string, count int64, block time.Duration) ([]goredis.XMessage, error) {
+func (b *inMemoryBuffer) ReadGroup(ctx context.Context, stream, group, consumer string, count int64, block time.Duration) ([]buffer.RawMessage, error) {
+	if len(b.messages) > 0 {
+		msgs := b.messages
+		b.messages = nil
+		return msgs, nil
+	}
 	return nil, nil
 }
 
-func (m *mockStreamClient) Ack(ctx context.Context, stream, group string, ids ...string) error {
+func (b *inMemoryBuffer) Ack(ctx context.Context, stream, group string, ids ...string) error {
+	b.acked = append(b.acked, ids...)
 	return nil
 }
 
-func (m *mockStreamClient) Close() error {
+func (b *inMemoryBuffer) Ping(ctx context.Context) error {
 	return nil
 }
 
-func (m *mockStreamClient) Ping(ctx context.Context) error {
+func (b *inMemoryBuffer) Close() error {
 	return nil
 }
 
-func setupTestPipeline() (*ingestion.Handler, *mockStreamClient, validation.Validator, error) {
+func TestFullTargetArchitecture_E2E(t *testing.T) {
+	rawBuf := &inMemoryBuffer{}
+	rawStore := raw.NewMemoryRawStore()
+
+	// Ingestion Setup
+	ingestService := ingestion.NewService(rawBuf, "raw_events")
+	ingestHandler := ingestion.NewHandler(ingestService)
+
+	// Worker Setup
 	detector := detection.NewDetector()
-	registry := normalization.NewRegistry()
+	driftDetector := detection.NewDriftDetector()
+	registry := parsing.NewRegistry()
 	registry.Register(parsers.NewSyslogParser())
 	registry.Register(parsers.NewJSONParser())
 	registry.Register(parsers.NewCSVParser())
-
-	normalizer := normalization.NewNormalizer(detector, registry)
+	parserEngine := parsing.NewEngine(registry)
+	normalizer := normalization.NewNormalizer()
 	validator, err := validation.NewValidator("")
 	if err != nil {
-		return nil, nil, nil, err
+		t.Fatalf("failed to create validator: %v", err)
 	}
 
-	mockStream := &mockStreamClient{}
-	handler := ingestion.NewHandler(normalizer, validator, mockStream, "test_stream")
-	return handler, mockStream, validator, nil
-}
-
-func TestEndToEndPipeline_HTTP(t *testing.T) {
-	handler, mockStream, _, err := setupTestPipeline()
-	if err != nil {
-		t.Fatalf("failed to setup pipeline: %v", err)
-	}
+	w := worker.NewWorker(
+		rawBuf,
+		rawStore,
+		detector,
+		driftDetector,
+		parserEngine,
+		normalizer,
+		validator,
+		worker.Config{
+			StreamName:   "raw_events",
+			GroupName:    "test-group",
+			ConsumerName: "test-worker",
+		},
+	)
 
 	samples := []struct {
 		name       string
@@ -96,71 +121,95 @@ func TestEndToEndPipeline_HTTP(t *testing.T) {
 		},
 	}
 
+	var results []*worker.PipelineResult
+
 	for _, s := range samples {
 		t.Run(s.name, func(t *testing.T) {
 			content, err := os.ReadFile(s.samplePath)
 			if err != nil {
-				t.Fatalf("failed to read sample %s: %v", s.samplePath, err)
+				t.Fatalf("failed to read sample: %v", err)
 			}
 
+			// 1. POST to /ingest
 			reqBody := ingestion.IngestRequest{
 				Format:  s.hint,
-				Source:  "test-fw",
+				Source:  "firewall-01",
 				Payload: string(content),
 			}
-			bodyBytes, _ := json.Marshal(reqBody)
-
-			req := httptest.NewRequest(http.MethodPost, "/ingest", bytes.NewBuffer(bodyBytes))
-			req.Header.Set("Content-Type", "application/json")
+			reqBytes, _ := json.Marshal(reqBody)
+			req := httptest.NewRequest(http.MethodPost, "/ingest", bytes.NewBuffer(reqBytes))
 			rec := httptest.NewRecorder()
 
-			handler.HandleIngest(rec, req)
+			ingestHandler.HandleIngest(rec, req)
 
 			if rec.Code != http.StatusAccepted {
 				t.Fatalf("expected 202 Accepted, got %d: %s", rec.Code, rec.Body.String())
 			}
 
-			var resp ingestion.IngestResponse
-			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-				t.Fatalf("failed to unmarshal response: %v", err)
+			var ingestResp ingestion.IngestResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &ingestResp); err != nil {
+				t.Fatalf("failed to decode ingest response: %v", err)
 			}
 
-			if resp.EventID == "" || resp.Status != "accepted" {
-				t.Fatalf("invalid response body: %+v", resp)
+			// 2. Verify buffered in Redis
+			if len(rawBuf.messages) == 0 {
+				t.Fatalf("expected message buffered in Redis, found none")
 			}
+			rawMsg := rawBuf.messages[0]
+			rawBuf.messages = nil // simulate consuming
+
+			// 3. Process via Worker
+			res, err := w.ProcessSingleEvent(context.Background(), rawMsg.Event)
+			if err != nil {
+				t.Fatalf("worker process failed: %v", err)
+			}
+			if !res.Valid {
+				t.Fatalf("event failed validation: %+v", res.Errors)
+			}
+
+			// 4. Verify Immutable Raw Copy in RawEventStore
+			storedRaw, err := rawStore.Get(context.Background(), ingestResp.EventID)
+			if err != nil {
+				t.Fatalf("raw event not found in RawEventStore: %v", err)
+			}
+			if storedRaw.Payload != string(content) {
+				t.Errorf("stored raw payload mismatch: expected %q, got %q", string(content), storedRaw.Payload)
+			}
+
+			results = append(results, res)
 		})
 	}
 
-	if len(mockStream.published) != 3 {
-		t.Fatalf("expected 3 published events in stream, got %d", len(mockStream.published))
+	// 5. Verify Universal Event Schema Convergence
+	if len(results) != 3 {
+		t.Fatalf("expected 3 results, got %d", len(results))
 	}
 
-	// Verify Universal Event convergence across all 3 formats
-	for _, published := range mockStream.published {
-		evt := published.Event
+	for _, r := range results {
+		evt := r.UniversalEvent
 		if evt.SchemaVersion != "1.0" {
-			t.Errorf("expected schema_version '1.0', got %q", evt.SchemaVersion)
+			t.Errorf("expected SchemaVersion '1.0', got %q", evt.SchemaVersion)
 		}
 		if evt.Event.Action != "deny" {
-			t.Errorf("expected action 'deny', got %q", evt.Event.Action)
+			t.Errorf("expected Action 'deny', got %q", evt.Event.Action)
 		}
 		if evt.Network == nil {
 			t.Fatalf("expected non-nil network info")
 		}
 		if evt.Network.Protocol != "TCP" {
-			t.Errorf("expected protocol 'TCP', got %q", evt.Network.Protocol)
+			t.Errorf("expected Protocol 'TCP', got %q", evt.Network.Protocol)
 		}
 		if evt.Network.SrcIP != "192.168.1.20" {
-			t.Errorf("expected src_ip '192.168.1.20', got %q", evt.Network.SrcIP)
+			t.Errorf("expected SrcIP '192.168.1.20', got %q", evt.Network.SrcIP)
 		}
 		if evt.Network.DstIP != "10.0.0.15" {
-			t.Errorf("expected dst_ip '10.0.0.15', got %q", evt.Network.DstIP)
+			t.Errorf("expected DstIP '10.0.0.15', got %q", evt.Network.DstIP)
 		}
 		if evt.Network.SrcPort == nil || *evt.Network.SrcPort != 54321 {
-			t.Errorf("expected src_port 54321, got %v", evt.Network.SrcPort)
+			t.Errorf("expected SrcPort 54321, got %v", evt.Network.SrcPort)
 		}
 		if evt.Network.DstPort == nil || *evt.Network.DstPort != 443 {
-			t.Errorf("expected dst_port 443, got %v", evt.Network.DstPort)
+			t.Errorf("expected DstPort 443, got %v", evt.Network.DstPort)
 		}
 	}
 }

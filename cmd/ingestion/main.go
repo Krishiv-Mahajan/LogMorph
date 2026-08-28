@@ -9,12 +9,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Krishiv-Mahajan/LogMorph/internal/detection"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/buffer"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/ingestion"
-	"github.com/Krishiv-Mahajan/LogMorph/internal/normalization"
-	"github.com/Krishiv-Mahajan/LogMorph/internal/normalization/parsers"
-	"github.com/Krishiv-Mahajan/LogMorph/internal/redis"
-	"github.com/Krishiv-Mahajan/LogMorph/internal/validation"
 )
 
 func main() {
@@ -28,48 +24,33 @@ func main() {
 		redisAddr = "localhost:6379"
 	}
 	redisPassword := os.Getenv("REDIS_PASSWORD")
-	streamName := os.Getenv("STREAM_NAME")
-	if streamName == "" {
-		streamName = redis.DefaultStreamName
+
+	rawStream := os.Getenv("RAW_STREAM_NAME")
+	if rawStream == "" {
+		rawStream = buffer.DefaultRawStreamName
 	}
 
 	log.Println("[Ingestion] Initializing ULPF Ingestion Service...")
 
-	// 1. Detection
-	detector := detection.NewDetector()
-
-	// 2. Parsers & Registry
-	registry := normalization.NewRegistry()
-	registry.Register(parsers.NewSyslogParser())
-	registry.Register(parsers.NewJSONParser())
-	registry.Register(parsers.NewCSVParser())
-
-	// 3. Normalizer
-	normalizer := normalization.NewNormalizer(detector, registry)
-
-	// 4. Validator
-	validator, err := validation.NewValidator("")
+	// 1. Initialize Redis Raw Stream Buffer
+	rawBuffer, err := buffer.NewRedisRawBuffer(redisAddr, redisPassword, 0)
 	if err != nil {
-		log.Fatalf("[Ingestion] Failed to initialize JSON Schema validator: %v", err)
+		log.Fatalf("[Ingestion] Failed to connect to Redis buffer: %v", err)
 	}
-
-	// 5. Redis Client
-	redisClient, err := redis.NewStreamClient(redisAddr, redisPassword, 0)
-	if err != nil {
-		log.Fatalf("[Ingestion] Failed to create Redis client: %v", err)
-	}
-	defer redisClient.Close()
+	defer rawBuffer.Close()
 
 	ctxPing, cancelPing := context.WithTimeout(context.Background(), 2*time.Second)
-	if err := redisClient.Ping(ctxPing); err != nil {
-		log.Printf("[Ingestion] Warning: Redis not reachable at %s (%v). Running in degraded mode.", redisAddr, err)
+	if err := rawBuffer.Ping(ctxPing); err != nil {
+		log.Printf("[Ingestion] Warning: Redis not reachable at %s (%v).", redisAddr, err)
 	} else {
-		log.Printf("[Ingestion] Connected to Redis at %s", redisAddr)
+		log.Printf("[Ingestion] Connected to Redis stream buffer (%s) at %s", rawStream, redisAddr)
 	}
 	cancelPing()
 
-	// 6. Ingestion HTTP Handler
-	handler := ingestion.NewHandler(normalizer, validator, redisClient, streamName)
+	// 2. Ingestion Service & HTTP Handler
+	service := ingestion.NewService(rawBuffer, rawStream)
+	handler := ingestion.NewHandler(service)
+
 	mux := http.NewServeMux()
 	handler.RegisterRoutes(mux)
 
@@ -80,25 +61,25 @@ func main() {
 		WriteTimeout: 10 * time.Second,
 	}
 
-	// Graceful shutdown handling
+	// 3. Graceful Shutdown
 	stopChan := make(chan os.Signal, 1)
 	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
 		log.Printf("[Ingestion] HTTP API listening on :%s (endpoint: POST /ingest)", port)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("[Ingestion] Server failed: %v", err)
+			log.Fatalf("[Ingestion] Server error: %v", err)
 		}
 	}()
 
 	<-stopChan
-	log.Println("[Ingestion] Shutting down gracefully...")
+	log.Println("[Ingestion] Shutting down...")
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Printf("[Ingestion] Server shutdown error: %v", err)
+		log.Printf("[Ingestion] Shutdown error: %v", err)
 	}
 	log.Println("[Ingestion] Service stopped")
 }

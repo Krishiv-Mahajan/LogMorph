@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"regexp"
 	"strings"
+
+	"github.com/Krishiv-Mahajan/LogMorph/internal/models"
 )
 
 // Format constants
@@ -22,19 +24,12 @@ var (
 	syslogTokenRegex     = regexp.MustCompile(`(?i)\b(SRC|DST|SPT|DPT|PROTO|ACTION|DENY|ALLOW|ACCEPT|DROP)\b`)
 )
 
-// DetectionResult encapsulates the detected format, confidence score, and rationale.
-type DetectionResult struct {
-	Format     string  `json:"format"`
-	Confidence float64 `json:"confidence"`
-	Reason     string  `json:"reason"`
-}
-
-// Detector defines the interface for detecting log formats.
+// Detector defines the interface for detecting log formats and source types.
 type Detector interface {
-	Detect(payload string, hint string) DetectionResult
+	Detect(payload string, hint string) models.DetectionResult
 }
 
-// DefaultDetector implements deterministic format detection.
+// DefaultDetector implements deterministic format and source detection.
 type DefaultDetector struct{}
 
 // NewDetector returns a new DefaultDetector.
@@ -42,22 +37,38 @@ func NewDetector() *DefaultDetector {
 	return &DefaultDetector{}
 }
 
-// Detect analyzes the payload and optional hint to determine log format.
-func (d *DefaultDetector) Detect(payload string, hint string) DetectionResult {
+// Detect analyzes the payload and optional format hint to determine structure and source.
+func (d *DefaultDetector) Detect(payload string, hint string) models.DetectionResult {
 	cleanedHint := strings.ToLower(strings.TrimSpace(hint))
 	switch cleanedHint {
-	case FormatSyslog, FormatJSON, FormatCSV:
-		return DetectionResult{
-			Format:     cleanedHint,
+	case FormatSyslog:
+		return models.DetectionResult{
+			Format:     FormatSyslog,
+			SourceType: "firewall",
 			Confidence: 1.0,
-			Reason:     "Format explicitly provided by caller",
+			Reason:     "Format explicitly provided by caller as syslog",
+		}
+	case FormatJSON:
+		return models.DetectionResult{
+			Format:     FormatJSON,
+			SourceType: "firewall",
+			Confidence: 1.0,
+			Reason:     "Format explicitly provided by caller as json",
+		}
+	case FormatCSV:
+		return models.DetectionResult{
+			Format:     FormatCSV,
+			SourceType: "firewall",
+			Confidence: 1.0,
+			Reason:     "Format explicitly provided by caller as csv",
 		}
 	}
 
 	trimmed := strings.TrimSpace(payload)
 	if trimmed == "" {
-		return DetectionResult{
+		return models.DetectionResult{
 			Format:     FormatUnknown,
+			SourceType: "unknown",
 			Confidence: 0.0,
 			Reason:     "Payload is empty",
 		}
@@ -67,8 +78,9 @@ func (d *DefaultDetector) Detect(payload string, hint string) DetectionResult {
 	if (strings.HasPrefix(trimmed, "{") && strings.HasSuffix(trimmed, "}")) ||
 		(strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]")) {
 		if json.Valid([]byte(trimmed)) {
-			return DetectionResult{
+			return models.DetectionResult{
 				Format:     FormatJSON,
+				SourceType: "firewall",
 				Confidence: 0.95,
 				Reason:     "Valid JSON structure detected",
 			}
@@ -81,7 +93,6 @@ func (d *DefaultDetector) Detect(payload string, hint string) DetectionResult {
 		reader.TrimLeadingSpace = true
 		records, err := reader.ReadAll()
 		if err == nil && len(records) > 0 && len(records[0]) >= 2 {
-			headerLine := strings.ToLower(records[0][0])
 			hasHeaderSignals := false
 			for _, col := range records[0] {
 				c := strings.ToLower(strings.TrimSpace(col))
@@ -90,9 +101,10 @@ func (d *DefaultDetector) Detect(payload string, hint string) DetectionResult {
 					break
 				}
 			}
-			if hasHeaderSignals || headerLine == "timestamp" || len(records) > 1 {
-				return DetectionResult{
+			if hasHeaderSignals || len(records) > 1 {
+				return models.DetectionResult{
 					Format:     FormatCSV,
+					SourceType: "firewall",
 					Confidence: 0.90,
 					Reason:     "CSV column structure detected",
 				}
@@ -102,15 +114,17 @@ func (d *DefaultDetector) Detect(payload string, hint string) DetectionResult {
 
 	// 3. Syslog Detection
 	if syslogTimestampRegex.MatchString(trimmed) || syslogTokenRegex.MatchString(trimmed) {
-		return DetectionResult{
+		return models.DetectionResult{
 			Format:     FormatSyslog,
+			SourceType: "firewall",
 			Confidence: 0.85,
 			Reason:     "Syslog timestamp or key-value pattern detected",
 		}
 	}
 
-	return DetectionResult{
+	return models.DetectionResult{
 		Format:     FormatUnknown,
+		SourceType: "unknown",
 		Confidence: 0.0,
 		Reason:     "Unable to deterministically match syslog, json, or csv structure",
 	}

@@ -1,6 +1,7 @@
 package parsers
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"regexp"
@@ -12,23 +13,22 @@ import (
 )
 
 var (
-	// Matches: Aug 28 18:30:12 firewall01 ...
 	syslogHeaderRegex = regexp.MustCompile(`^(?:<\d+>)?([A-Z][a-z]{2}\s+\d+\s+\d{2}:\d{2}:\d{2})\s+(\S+)\s+(.*)$`)
 	kvRegex           = regexp.MustCompile(`(?i)\b([A-Z_]+)=([^\s]+)`)
 )
 
-// SyslogParser parses security and firewall Syslog messages.
+// SyslogParser parses security and firewall Syslog messages into a ParsedEvent.
 type SyslogParser struct{}
 
 func NewSyslogParser() *SyslogParser {
 	return &SyslogParser{}
 }
 
-func (p *SyslogParser) Name() string {
+func (p *SyslogParser) Format() string {
 	return "syslog"
 }
 
-func (p *SyslogParser) Parse(raw models.RawEvent) (*models.UniversalEvent, error) {
+func (p *SyslogParser) Parse(ctx context.Context, raw models.RawEvent) (*models.ParsedEvent, error) {
 	trimmed := strings.TrimSpace(raw.Payload)
 	if trimmed == "" {
 		return nil, fmt.Errorf("empty syslog payload")
@@ -41,7 +41,6 @@ func (p *SyslogParser) Parse(raw models.RawEvent) (*models.UniversalEvent, error
 		host = matches[2]
 		body = matches[3]
 	} else {
-		// Fallback for logs without standard header
 		body = trimmed
 		host = raw.Source
 		if host == "" {
@@ -51,7 +50,6 @@ func (p *SyslogParser) Parse(raw models.RawEvent) (*models.UniversalEvent, error
 
 	normalizedTime := parseSyslogTimestamp(timestampStr)
 
-	// Extract key-values and action tokens from body
 	kvMap := make(map[string]string)
 	for _, kv := range kvRegex.FindAllStringSubmatch(body, -1) {
 		if len(kv) == 3 {
@@ -59,7 +57,6 @@ func (p *SyslogParser) Parse(raw models.RawEvent) (*models.UniversalEvent, error
 		}
 	}
 
-	// Determine Action & Protocol
 	action := "unknown"
 	protocol := "unknown"
 	tokens := strings.Fields(body)
@@ -81,7 +78,6 @@ func (p *SyslogParser) Parse(raw models.RawEvent) (*models.UniversalEvent, error
 		protocol = strings.ToUpper(proto)
 	}
 
-	// Extract Network info (SRC=192.168.1.20:54321 or SRC=... SPT=...)
 	netInfo := &models.NetworkInfo{
 		Protocol: protocol,
 	}
@@ -122,9 +118,8 @@ func (p *SyslogParser) Parse(raw models.RawEvent) (*models.UniversalEvent, error
 		identifier = raw.Source
 	}
 
-	event := &models.UniversalEvent{
-		SchemaVersion: "1.0",
-		Timestamp:     normalizedTime,
+	return &models.ParsedEvent{
+		Timestamp: normalizedTime,
 		Source: models.SourceInfo{
 			Type:       "firewall",
 			Vendor:     "generic",
@@ -138,16 +133,7 @@ func (p *SyslogParser) Parse(raw models.RawEvent) (*models.UniversalEvent, error
 		},
 		Network: netInfo,
 		User:    &models.UserInfo{Username: nil},
-		Raw: models.RawInfo{
-			Format:  "syslog",
-			Message: raw.Payload,
-		},
-		Metadata: models.MetadataInfo{
-			ParserVersion: "1.0",
-		},
-	}
-
-	return event, nil
+	}, nil
 }
 
 func splitIPAndPort(val string) (string, *int) {
@@ -167,12 +153,10 @@ func parseSyslogTimestamp(raw string) string {
 		return time.Now().UTC().Format(time.RFC3339)
 	}
 
-	// Try RFC3339
 	if t, err := time.Parse(time.RFC3339, raw); err == nil {
 		return t.UTC().Format(time.RFC3339)
 	}
 
-	// Standard BSD: "Aug 28 18:30:12"
 	refYear := time.Now().UTC().Year()
 	layout := "2006 Jan 02 15:04:05"
 	fullStr := fmt.Sprintf("%d %s", refYear, raw)

@@ -2,94 +2,166 @@ package worker
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"time"
 
+	"github.com/Krishiv-Mahajan/LogMorph/internal/buffer"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/detection"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/models"
-	"github.com/Krishiv-Mahajan/LogMorph/internal/redis"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/normalization"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/parsing"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/raw"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/validation"
 )
 
-// ProcessFunc is the handler function invoked for every received worker event.
-type ProcessFunc func(ctx context.Context, event *models.WorkerEvent) error
+// PipelineResult represents the outcome of running a RawEvent through the processing pipeline.
+type PipelineResult struct {
+	EventID        string
+	UniversalEvent *models.UniversalEvent
+	Valid          bool
+	Errors         []validation.ValidationError
+	Drift          models.DriftResult
+}
 
-// Worker consumes and processes normalized events from Redis Streams.
+// Worker coordinates raw event consumption, immutable storage, and the processing pipeline.
 type Worker struct {
-	client       redis.StreamClient
+	buffer        buffer.RawBuffer
+	rawStore      raw.RawEventStore
+	detector      detection.Detector
+	driftDetector detection.DriftDetector
+	parserEngine  parsing.Engine
+	normalizer    *normalization.Normalizer
+	validator     validation.Validator
+
 	streamName   string
 	groupName    string
 	consumerName string
-	processFunc  ProcessFunc
 }
 
-// Config contains worker configuration options.
+// Config provides configuration options for the worker.
 type Config struct {
 	StreamName   string
 	GroupName    string
 	ConsumerName string
-	ProcessFunc  ProcessFunc
 }
 
-// NewWorker initializes a new stream worker.
-func NewWorker(client redis.StreamClient, cfg Config) *Worker {
+// NewWorker initializes a processing worker.
+func NewWorker(
+	buf buffer.RawBuffer,
+	rawStore raw.RawEventStore,
+	detector detection.Detector,
+	driftDetector detection.DriftDetector,
+	parserEngine parsing.Engine,
+	normalizer *normalization.Normalizer,
+	validator validation.Validator,
+	cfg Config,
+) *Worker {
 	if cfg.StreamName == "" {
-		cfg.StreamName = redis.DefaultStreamName
+		cfg.StreamName = buffer.DefaultRawStreamName
 	}
 	if cfg.GroupName == "" {
-		cfg.GroupName = redis.DefaultGroupName
+		cfg.GroupName = buffer.DefaultGroupName
 	}
 	if cfg.ConsumerName == "" {
 		cfg.ConsumerName = "worker-1"
 	}
-	if cfg.ProcessFunc == nil {
-		cfg.ProcessFunc = DefaultProcessFunc
-	}
 
 	return &Worker{
-		client:       client,
-		streamName:   cfg.StreamName,
-		groupName:    cfg.GroupName,
-		consumerName: cfg.ConsumerName,
-		processFunc:  cfg.ProcessFunc,
+		buffer:        buf,
+		rawStore:      rawStore,
+		detector:      detector,
+		driftDetector: driftDetector,
+		parserEngine:  parserEngine,
+		normalizer:    normalizer,
+		validator:     validator,
+		streamName:    cfg.StreamName,
+		groupName:     cfg.GroupName,
+		consumerName:  cfg.ConsumerName,
 	}
 }
 
-// DefaultProcessFunc performs standard MVP logging for normalized events.
-func DefaultProcessFunc(ctx context.Context, event *models.WorkerEvent) error {
-	netDetails := "n/a"
-	if event.Event.Network != nil {
-		srcPort := 0
-		if event.Event.Network.SrcPort != nil {
-			srcPort = *event.Event.Network.SrcPort
+// ProcessSingleEvent executes the immutable raw store copy and full processing pipeline for one event.
+func (w *Worker) ProcessSingleEvent(ctx context.Context, rawEvent models.RawEvent) (*PipelineResult, error) {
+	// 1. Immutable Raw Event Store (Side-branch)
+	if w.rawStore != nil {
+		if err := w.rawStore.Put(ctx, &rawEvent); err != nil {
+			log.Printf("[Worker] Warning: failed to persist raw event %s to MinIO: %v", rawEvent.EventID, err)
 		}
-		dstPort := 0
-		if event.Event.Network.DstPort != nil {
-			dstPort = *event.Event.Network.DstPort
-		}
-		netDetails = fmt.Sprintf("%s:%d -> %s:%d (proto: %s)",
-			event.Event.Network.SrcIP, srcPort,
-			event.Event.Network.DstIP, dstPort,
-			event.Event.Network.Protocol)
 	}
 
-	log.Printf("[Worker] Processed event %s | format: %s | action: %s | net: %s | timestamp: %s",
-		event.EventID,
-		event.Event.Raw.Format,
-		event.Event.Event.Action,
-		netDetails,
-		event.Event.Timestamp,
-	)
-	return nil
+	// 2. Format / Source Detection
+	detectionRes := w.detector.Detect(rawEvent.Payload, rawEvent.Format)
+
+	// 3. Drift Analysis (MVP deterministic check)
+	driftRes, err := w.driftDetector.Analyze(ctx, rawEvent, detectionRes)
+	if err != nil {
+		log.Printf("[Worker] Drift analysis error for event %s: %v", rawEvent.EventID, err)
+	}
+	if driftRes.Status == models.DriftStatusUnknown || driftRes.Status == models.DriftStatusMajorDrift {
+		log.Printf("[Worker] Drift alert: event %s classified as %s (%s)", rawEvent.EventID, driftRes.Status, driftRes.Message)
+	}
+
+	// 4. Parser Engine
+	parsedEvent, err := w.parserEngine.Parse(ctx, rawEvent, detectionRes)
+	if err != nil {
+		return nil, fmt.Errorf("parsing failed: %w", err)
+	}
+
+	// 5. Normalization
+	universalEvent, err := w.normalizer.Normalize(rawEvent, parsedEvent, detectionRes)
+	if err != nil {
+		return nil, fmt.Errorf("normalization failed: %w", err)
+	}
+
+	// 6. JSON Schema Validation
+	valResult := w.validator.Validate(universalEvent)
+
+	res := &PipelineResult{
+		EventID:        universalEvent.EventID,
+		UniversalEvent: universalEvent,
+		Valid:          valResult.Valid,
+		Errors:         valResult.Errors,
+		Drift:          driftRes,
+	}
+
+	if valResult.Valid {
+		netDetails := "n/a"
+		if universalEvent.Network != nil {
+			srcPort := 0
+			if universalEvent.Network.SrcPort != nil {
+				srcPort = *universalEvent.Network.SrcPort
+			}
+			dstPort := 0
+			if universalEvent.Network.DstPort != nil {
+				dstPort = *universalEvent.Network.DstPort
+			}
+			netDetails = fmt.Sprintf("%s:%d -> %s:%d (proto: %s)",
+				universalEvent.Network.SrcIP, srcPort,
+				universalEvent.Network.DstIP, dstPort,
+				universalEvent.Network.Protocol)
+		}
+		log.Printf("[Worker] Processed event %s | format: %s | action: %s | net: %s | timestamp: %s",
+			universalEvent.EventID,
+			universalEvent.Raw.Format,
+			universalEvent.Event.Action,
+			netDetails,
+			universalEvent.Timestamp,
+		)
+	} else {
+		log.Printf("[Worker] Validation failed for event %s: %v", universalEvent.EventID, valResult.Errors)
+	}
+
+	return res, nil
 }
 
-// Start begins the event processing loop until context cancellation.
+// Start runs the continuous worker consumer loop until context cancellation.
 func (w *Worker) Start(ctx context.Context) error {
-	if err := w.client.EnsureConsumerGroup(ctx, w.streamName, w.groupName); err != nil {
+	if err := w.buffer.EnsureGroup(ctx, w.streamName, w.groupName); err != nil {
 		return fmt.Errorf("failed to ensure consumer group: %w", err)
 	}
 
-	log.Printf("[Worker] Started listening on stream %q as group %q consumer %q",
+	log.Printf("[Worker] Listening on stream %q (group: %q, consumer: %q)",
 		w.streamName, w.groupName, w.consumerName)
 
 	for {
@@ -100,7 +172,7 @@ func (w *Worker) Start(ctx context.Context) error {
 		default:
 		}
 
-		messages, err := w.client.ReadGroup(ctx, w.streamName, w.groupName, w.consumerName, 10, 2*time.Second)
+		messages, err := w.buffer.ReadGroup(ctx, w.streamName, w.groupName, w.consumerName, 10, 2*time.Second)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -111,25 +183,13 @@ func (w *Worker) Start(ctx context.Context) error {
 		}
 
 		for _, msg := range messages {
-			payloadStr, ok := msg.Values["payload"].(string)
-			if !ok {
-				log.Printf("[Worker] Message %s missing payload value", msg.ID)
-				_ = w.client.Ack(ctx, w.streamName, w.groupName, msg.ID)
-				continue
+			_, processErr := w.ProcessSingleEvent(ctx, msg.Event)
+			if processErr != nil {
+				log.Printf("[Worker] Error processing message %s (event %s): %v", msg.ID, msg.Event.EventID, processErr)
 			}
 
-			var event models.WorkerEvent
-			if err := json.Unmarshal([]byte(payloadStr), &event); err != nil {
-				log.Printf("[Worker] Failed to unmarshal message %s: %v", msg.ID, err)
-				_ = w.client.Ack(ctx, w.streamName, w.groupName, msg.ID)
-				continue
-			}
-
-			if err := w.processFunc(ctx, &event); err != nil {
-				log.Printf("[Worker] Error processing event %s: %v", event.EventID, err)
-			}
-
-			if err := w.client.Ack(ctx, w.streamName, w.groupName, msg.ID); err != nil {
+			// Acknowledge processed message in Redis
+			if err := w.buffer.Ack(ctx, w.streamName, w.groupName, msg.ID); err != nil {
 				log.Printf("[Worker] Failed to ack message %s: %v", msg.ID, err)
 			}
 		}

@@ -1,12 +1,38 @@
 package models
 
-// RawEvent represents incoming unparsed log data.
+// RawEvent represents incoming unparsed log data buffered immediately after ingestion.
 type RawEvent struct {
-	EventID    string `json:"event_id,omitempty"`
-	ReceivedAt string `json:"received_at,omitempty"`
+	EventID    string `json:"event_id"`
+	ReceivedAt string `json:"received_at"`
 	Format     string `json:"format,omitempty"`
 	Source     string `json:"source,omitempty"`
 	Payload    string `json:"payload"`
+}
+
+// DetectionResult encapsulates the detected format, source category, and confidence.
+type DetectionResult struct {
+	Format     string  `json:"format"`
+	SourceType string  `json:"source_type"`
+	Confidence float64 `json:"confidence"`
+	Reason     string  `json:"reason"`
+}
+
+// DriftStatus classifies the schema stability of an incoming event.
+type DriftStatus string
+
+const (
+	DriftStatusStable     DriftStatus = "stable"
+	DriftStatusMinorDrift DriftStatus = "minor_drift"
+	DriftStatusMajorDrift DriftStatus = "major_drift"
+	DriftStatusUnknown    DriftStatus = "unknown"
+)
+
+// DriftResult represents the outcome of drift evaluation.
+type DriftResult struct {
+	Status          DriftStatus `json:"status"`
+	Confidence      float64     `json:"confidence"`
+	Message         string      `json:"message"`
+	SuggestedAction string      `json:"suggested_action,omitempty"`
 }
 
 // SourceInfo contains metadata about the log producer.
@@ -50,7 +76,16 @@ type MetadataInfo struct {
 	IngestedAt    string `json:"ingested_at"`
 }
 
-// UniversalEvent is the canonical schema for all normalized logs.
+// ParsedEvent represents the structured domain fields extracted by a format parser.
+type ParsedEvent struct {
+	Timestamp string       `json:"timestamp"`
+	Source    SourceInfo   `json:"source"`
+	Event     EventInfo    `json:"event"`
+	Network   *NetworkInfo `json:"network,omitempty"`
+	User      *UserInfo    `json:"user,omitempty"`
+}
+
+// UniversalEvent is the canonical schema for all normalized logs (Schema v1.0).
 type UniversalEvent struct {
 	EventID       string       `json:"event_id"`
 	SchemaVersion string       `json:"schema_version"`
@@ -63,10 +98,10 @@ type UniversalEvent struct {
 	Metadata      MetadataInfo `json:"metadata"`
 }
 
-// WorkerEvent is the envelope transported through Redis Streams to workers.
+// WorkerEvent is the envelope used for downstream processing tasks.
 type WorkerEvent struct {
 	EventID       string         `json:"event_id"`
 	SchemaVersion string         `json:"schema_version"`
 	Event         UniversalEvent `json:"event"`
-	Metadata      map[string]any `json:"metadata"`
+	Metadata      map[string]any `json:"metadata,omitempty"`
 }
