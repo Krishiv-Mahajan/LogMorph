@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -56,11 +57,21 @@ func main() {
 	}
 	minioUseSSL := os.Getenv("MINIO_USE_SSL") == "true"
 
+	// RAW_EVENT_STREAM_MAXLEN caps the Redis stream length approximately (0 = unlimited).
+	maxLen, _ := strconv.ParseInt(os.Getenv("RAW_EVENT_STREAM_MAXLEN"), 10, 64)
+
+	// RAW_EVENT_CLAIM_IDLE_MS is the pending-message idle threshold for crash recovery.
+	// Defaults to 60000 ms (60 s). Set to 0 to disable crash recovery.
+	claimIdleMs, _ := strconv.ParseInt(os.Getenv("RAW_EVENT_CLAIM_IDLE_MS"), 10, 64)
+	if claimIdleMs == 0 {
+		claimIdleMs = 60000
+	}
+
 	log.Printf("[Worker] Initializing ULPF Processing Worker (Redis: %s, Stream: %s, Group: %s)...",
 		redisAddr, rawStream, groupName)
 
 	// 1. Redis Raw Stream Buffer
-	rawBuffer, err := buffer.NewRedisRawBuffer(redisAddr, redisPassword, 0)
+	rawBuffer, err := buffer.NewRedisRawBuffer(redisAddr, redisPassword, 0, maxLen)
 	if err != nil {
 		log.Fatalf("[Worker] Failed to create Redis buffer client: %v", err)
 	}
@@ -134,6 +145,7 @@ func main() {
 			StreamName:   rawStream,
 			GroupName:    groupName,
 			ConsumerName: consumerName,
+			ClaimIdleMs:  claimIdleMs,
 		},
 	)
 

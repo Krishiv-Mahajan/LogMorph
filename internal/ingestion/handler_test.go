@@ -34,6 +34,10 @@ func (m *mockRawBuffer) Ack(ctx context.Context, stream, group string, ids ...st
 	return nil
 }
 
+func (m *mockRawBuffer) ClaimPending(ctx context.Context, stream, group, consumer string, minIdleTime time.Duration, count int64) ([]buffer.RawMessage, error) {
+	return nil, nil
+}
+
 func (m *mockRawBuffer) Ping(ctx context.Context) error {
 	return nil
 }

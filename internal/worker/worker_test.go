@@ -16,8 +16,10 @@ import (
 )
 
 type mockWorkerBuffer struct {
-	messages []buffer.RawMessage
-	acked    []string
+	messages        []buffer.RawMessage
+	pendingMessages []buffer.RawMessage
+	acked           []string
+	claimCalled     bool
 }
 
 func (m *mockWorkerBuffer) PublishRaw(ctx context.Context, stream string, event *models.RawEvent) (string, error) {
@@ -41,6 +43,16 @@ func (m *mockWorkerBuffer) ReadGroup(ctx context.Context, stream, group, consume
 func (m *mockWorkerBuffer) Ack(ctx context.Context, stream, group string, ids ...string) error {
 	m.acked = append(m.acked, ids...)
 	return nil
+}
+
+func (m *mockWorkerBuffer) ClaimPending(ctx context.Context, stream, group, consumer string, minIdleTime time.Duration, count int64) ([]buffer.RawMessage, error) {
+	m.claimCalled = true
+	if len(m.pendingMessages) > 0 {
+		msgs := m.pendingMessages
+		m.pendingMessages = nil
+		return msgs, nil
+	}
+	return nil, nil
 }
 
 func (m *mockWorkerBuffer) Ping(ctx context.Context) error {
@@ -121,5 +133,87 @@ func TestWorker_FullPipelineAndStorage(t *testing.T) {
 	}
 	if storedRaw.Payload != "Aug 28 18:30:12 firewall01 DENY TCP SRC=192.168.1.20:54321 DST=10.0.0.15:443" {
 		t.Errorf("stored raw payload mismatch: %s", storedRaw.Payload)
+	}
+}
+
+// TestWorker_ClaimsPendingOnRecovery verifies that when ClaimIdleMs > 0 the worker
+// calls ClaimPending, processes the returned messages through the full pipeline,
+// ACKs them, and stores the exact original payload in the raw event store.
+func TestWorker_ClaimsPendingOnRecovery(t *testing.T) {
+	const payload = "Aug 28 18:30:12 firewall01 DENY TCP SRC=192.168.1.20:54321 DST=10.0.0.15:443"
+
+	pendingMsg := buffer.RawMessage{
+		ID: "1670000000001-0",
+		Event: models.RawEvent{
+			EventID:    "evt_crash_recovery_test",
+			ReceivedAt: time.Now().UTC().Format(time.RFC3339),
+			Format:     "syslog",
+			Source:     "firewall-recovery",
+			Payload:    payload,
+		},
+	}
+
+	// Buffer starts empty (no new messages); the pending message simulates a
+	// message left behind by a crashed worker.
+	mockBuf := &mockWorkerBuffer{
+		pendingMessages: []buffer.RawMessage{pendingMsg},
+	}
+	rawStore := raw.NewMemoryRawStore()
+
+	detector := detection.NewDetector()
+	driftDetector := detection.NewDriftDetector()
+	registry := parsing.NewRegistry()
+	registry.Register(parsers.NewSyslogParser())
+	registry.Register(parsers.NewJSONParser())
+	registry.Register(parsers.NewCSVParser())
+	parserEngine := parsing.NewEngine(registry)
+	normalizer := normalization.NewNormalizer()
+	validator, err := validation.NewValidator("")
+	if err != nil {
+		t.Fatalf("failed to create validator: %v", err)
+	}
+
+	w := NewWorker(
+		mockBuf,
+		rawStore,
+		detector,
+		driftDetector,
+		parserEngine,
+		normalizer,
+		validator,
+		Config{
+			StreamName:   "raw_events",
+			GroupName:    "test-group",
+			ConsumerName: "test-worker",
+			// 1 ms idle threshold so the claim fires immediately in the test.
+			ClaimIdleMs: 1,
+		},
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	_ = w.Start(ctx)
+
+	// 1. Verify ClaimPending was called.
+	if !mockBuf.claimCalled {
+		t.Error("expected ClaimPending to be called for crash recovery, but it was not")
+	}
+
+	// 2. Verify the reclaimed message was acknowledged.
+	if len(mockBuf.acked) == 0 {
+		t.Fatalf("expected pending message to be ACKed after recovery, acked list is empty")
+	}
+	if mockBuf.acked[0] != pendingMsg.ID {
+		t.Errorf("expected ACKed ID %q, got %q", pendingMsg.ID, mockBuf.acked[0])
+	}
+
+	// 3. Verify exact raw payload was preserved in the immutable raw store.
+	stored, err := rawStore.Get(context.Background(), "evt_crash_recovery_test")
+	if err != nil {
+		t.Fatalf("expected raw event in store after recovery: %v", err)
+	}
+	if stored.Payload != payload {
+		t.Errorf("raw payload corrupted: expected %q, got %q", payload, stored.Payload)
 	}
 }

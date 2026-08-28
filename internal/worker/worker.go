@@ -34,9 +34,12 @@ type Worker struct {
 	normalizer    *normalization.Normalizer
 	validator     validation.Validator
 
-	streamName   string
-	groupName    string
-	consumerName string
+	streamName    string
+	groupName     string
+	consumerName  string
+	// claimIdleTime is the minimum idle duration a pending message must have before
+	// this worker will reclaim it via XAUTOCLAIM. 0 means crash recovery is disabled.
+	claimIdleTime time.Duration
 }
 
 // Config provides configuration options for the worker.
@@ -44,6 +47,9 @@ type Config struct {
 	StreamName   string
 	GroupName    string
 	ConsumerName string
+	// ClaimIdleMs is the pending-message idle threshold in milliseconds used for
+	// crash recovery (XAUTOCLAIM). 0 disables crash recovery. Default: 60000 (60 s).
+	ClaimIdleMs int64
 }
 
 // NewWorker initializes a processing worker.
@@ -67,7 +73,7 @@ func NewWorker(
 		cfg.ConsumerName = "worker-1"
 	}
 
-	return &Worker{
+	w := &Worker{
 		buffer:        buf,
 		rawStore:      rawStore,
 		detector:      detector,
@@ -79,6 +85,12 @@ func NewWorker(
 		groupName:     cfg.GroupName,
 		consumerName:  cfg.ConsumerName,
 	}
+
+	if cfg.ClaimIdleMs > 0 {
+		w.claimIdleTime = time.Duration(cfg.ClaimIdleMs) * time.Millisecond
+	}
+
+	return w
 }
 
 // ProcessSingleEvent executes the immutable raw store copy and full processing pipeline for one event.
@@ -156,6 +168,10 @@ func (w *Worker) ProcessSingleEvent(ctx context.Context, rawEvent models.RawEven
 }
 
 // Start runs the continuous worker consumer loop until context cancellation.
+//
+// Crash recovery: when ClaimIdleMs > 0, the loop periodically calls ClaimPending
+// (XAUTOCLAIM) to reclaim messages that were delivered to a crashed consumer and
+// never acknowledged. The reclaim interval is half the idle threshold.
 func (w *Worker) Start(ctx context.Context) error {
 	if err := w.buffer.EnsureGroup(ctx, w.streamName, w.groupName); err != nil {
 		return fmt.Errorf("failed to ensure consumer group: %w", err)
@@ -163,6 +179,14 @@ func (w *Worker) Start(ctx context.Context) error {
 
 	log.Printf("[Worker] Listening on stream %q (group: %q, consumer: %q)",
 		w.streamName, w.groupName, w.consumerName)
+
+	// Schedule the first pending-message reclaim check.
+	var nextClaimAt time.Time
+	if w.claimIdleTime > 0 {
+		nextClaimAt = time.Now().Add(w.claimIdleTime / 2)
+		log.Printf("[Worker] Crash recovery enabled: reclaiming messages idle >%s (check every %s)",
+			w.claimIdleTime, w.claimIdleTime/2)
+	}
 
 	for {
 		select {
@@ -172,6 +196,20 @@ func (w *Worker) Start(ctx context.Context) error {
 		default:
 		}
 
+		// --- Crash recovery: reclaim pending messages from crashed consumers ---
+		if w.claimIdleTime > 0 && time.Now().After(nextClaimAt) {
+			nextClaimAt = time.Now().Add(w.claimIdleTime / 2)
+			pending, claimErr := w.buffer.ClaimPending(
+				ctx, w.streamName, w.groupName, w.consumerName, w.claimIdleTime, 10)
+			if claimErr != nil {
+				log.Printf("[Worker] Error claiming pending messages: %v", claimErr)
+			} else if len(pending) > 0 {
+				log.Printf("[Worker] Reclaimed %d pending message(s) from crashed consumers", len(pending))
+				w.processMessages(ctx, pending)
+			}
+		}
+
+		// --- Normal consumption of new messages ---
 		messages, err := w.buffer.ReadGroup(ctx, w.streamName, w.groupName, w.consumerName, 10, 2*time.Second)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -182,16 +220,26 @@ func (w *Worker) Start(ctx context.Context) error {
 			continue
 		}
 
-		for _, msg := range messages {
-			_, processErr := w.ProcessSingleEvent(ctx, msg.Event)
-			if processErr != nil {
-				log.Printf("[Worker] Error processing message %s (event %s): %v", msg.ID, msg.Event.EventID, processErr)
-			}
+		w.processMessages(ctx, messages)
+	}
+}
 
-			// Acknowledge processed message in Redis
-			if err := w.buffer.Ack(ctx, w.streamName, w.groupName, msg.ID); err != nil {
-				log.Printf("[Worker] Failed to ack message %s: %v", msg.ID, err)
-			}
+// processMessages runs each message through the pipeline and ACKs it.
+// It mirrors the previous inline loop so the behaviour is identical whether
+// messages came from ReadGroup or ClaimPending.
+func (w *Worker) processMessages(ctx context.Context, messages []buffer.RawMessage) {
+	for _, msg := range messages {
+		if ctx.Err() != nil {
+			return
+		}
+		_, processErr := w.ProcessSingleEvent(ctx, msg.Event)
+		if processErr != nil {
+			log.Printf("[Worker] Error processing message %s (event %s): %v", msg.ID, msg.Event.EventID, processErr)
+		}
+
+		// Acknowledge processed message in Redis (matches existing ACK-even-on-error semantics).
+		if err := w.buffer.Ack(ctx, w.streamName, w.groupName, msg.ID); err != nil {
+			log.Printf("[Worker] Failed to ack message %s: %v", msg.ID, err)
 		}
 	}
 }
