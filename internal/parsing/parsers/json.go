@@ -37,12 +37,12 @@ type jsonLogSchema struct {
 		Severity string `json:"severity"`
 	} `json:"firewall"`
 	Network *struct {
-		Protocol    string      `json:"protocol"`
-		SrcIP       string      `json:"src_ip"`
-		SrcPort     interface{} `json:"src_port"`
-		DstIP       string      `json:"dst_ip"`
-		DstPort     interface{} `json:"dst_port"`
-		Source      *struct {
+		Protocol string      `json:"protocol"`
+		SrcIP    string      `json:"src_ip"`
+		SrcPort  interface{} `json:"src_port"`
+		DstIP    string      `json:"dst_ip"`
+		DstPort  interface{} `json:"dst_port"`
+		Source   *struct {
 			IP   string      `json:"ip"`
 			Port interface{} `json:"port"`
 		} `json:"source"`
