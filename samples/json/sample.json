@@ -1,0 +1,17 @@
+{
+  "timestamp": "2026-08-28T18:30:12Z",
+  "firewall": {
+    "action": "deny",
+    "protocol": "TCP"
+  },
+  "network": {
+    "source": {
+      "ip": "192.168.1.20",
+      "port": 54321
+    },
+    "destination": {
+      "ip": "10.0.0.15",
+      "port": 443
+    }
+  }
+}

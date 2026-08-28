@@ -1,0 +1,31 @@
+{
+  "schema_version": "1.0",
+  "source": {
+    "type": "firewall",
+    "vendor": "generic",
+    "product": "syslog-firewall",
+    "identifier": "firewall01"
+  },
+  "event": {
+    "category": "network",
+    "action": "deny",
+    "severity": "high"
+  },
+  "network": {
+    "src_ip": "192.168.1.20",
+    "src_port": 54321,
+    "dst_ip": "10.0.0.15",
+    "dst_port": 443,
+    "protocol": "TCP"
+  },
+  "user": {
+    "username": null
+  },
+  "raw": {
+    "format": "syslog",
+    "message": "Aug 28 18:30:12 firewall01 DENY TCP SRC=192.168.1.20:54321 DST=10.0.0.15:443"
+  },
+  "metadata": {
+    "parser_version": "1.0"
+  }
+}

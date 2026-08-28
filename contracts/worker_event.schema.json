@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WorkerEvent",
+  "description": "ULPF Worker Event Transport Contract",
+  "type": "object",
+  "required": [
+    "event_id",
+    "schema_version",
+    "event",
+    "metadata"
+  ],
+  "properties": {
+    "event_id": {
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "string"
+    },
+    "event": {
+      "$ref": "universal_event.schema.json"
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "published_at": {
+          "type": "string"
+        },
+        "stream_name": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

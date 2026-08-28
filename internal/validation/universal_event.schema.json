@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "UniversalEvent",
+  "description": "ULPF Universal Event Schema v1.0",
+  "type": "object",
+  "required": [
+    "event_id",
+    "schema_version",
+    "timestamp",
+    "source",
+    "event",
+    "raw",
+    "metadata"
+  ],
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "schema_version": {
+      "type": "string",
+      "enum": ["1.0"]
+    },
+    "timestamp": {
+      "type": "string"
+    },
+    "source": {
+      "type": "object",
+      "properties": {
+        "type": { "type": ["string", "null"] },
+        "vendor": { "type": ["string", "null"] },
+        "product": { "type": ["string", "null"] },
+        "identifier": { "type": ["string", "null"] }
+      },
+      "additionalProperties": true
+    },
+    "event": {
+      "type": "object",
+      "properties": {
+        "category": { "type": ["string", "null"] },
+        "action": { "type": ["string", "null"] },
+        "severity": { "type": ["string", "null"] }
+      },
+      "additionalProperties": true
+    },
+    "network": {
+      "type": ["object", "null"],
+      "properties": {
+        "src_ip": { "type": ["string", "null"] },
+        "src_port": { "type": ["integer", "null"], "minimum": 0, "maximum": 65535 },
+        "dst_ip": { "type": ["string", "null"] },
+        "dst_port": { "type": ["integer", "null"], "minimum": 0, "maximum": 65535 },
+        "protocol": { "type": ["string", "null"] }
+      },
+      "additionalProperties": true
+    },
+    "user": {
+      "type": ["object", "null"],
+      "properties": {
+        "username": { "type": ["string", "null"] }
+      },
+      "additionalProperties": true
+    },
+    "raw": {
+      "type": "object",
+      "required": ["format", "message"],
+      "properties": {
+        "format": { "type": "string" },
+        "message": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "metadata": {
+      "type": "object",
+      "required": ["parser_version", "ingested_at"],
+      "properties": {
+        "parser_version": { "type": "string" },
+        "ingested_at": { "type": "string" }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}
