@@ -26,20 +26,34 @@ type PipelineResult struct {
 
 // Worker coordinates raw event consumption, immutable storage, and the processing pipeline.
 type Worker struct {
-	buffer        buffer.RawBuffer
-	rawStore      raw.RawEventStore
-	detector      detection.Detector
+	buffer       buffer.RawBuffer
+	idempotency  buffer.IdempotencyStore
+	rawStore     raw.RawEventStore
+	detector     detection.Detector
 	driftDetector detection.DriftDetector
-	parserEngine  parsing.Engine
-	normalizer    *normalization.Normalizer
-	validator     validation.Validator
+	parserEngine parsing.Engine
+	normalizer   *normalization.Normalizer
+	validator    validation.Validator
 
-	streamName    string
-	groupName     string
-	consumerName  string
-	// claimIdleTime is the minimum idle duration a pending message must have before
-	// this worker will reclaim it via XAUTOCLAIM. 0 means crash recovery is disabled.
+	streamName   string
+	groupName    string
+	consumerName string
+
+	// claimIdleTime is the minimum idle duration before XAUTOCLAIM reclaims a
+	// pending message. 0 disables crash recovery.
 	claimIdleTime time.Duration
+
+	// lockTTL is the Redis processing-lock TTL for idempotency. A crashed
+	// worker's lock automatically expires after this duration so XAUTOCLAIM
+	// can trigger a successful retry.
+	lockTTL time.Duration
+
+	// doneTTL is the TTL for the "successfully processed" marker in Redis.
+	doneTTL time.Duration
+
+	// batchSize is the maximum number of messages fetched per ReadGroup /
+	// ClaimPending call. Configurable via WORKER_BATCH_SIZE (default 10).
+	batchSize int64
 }
 
 // Config provides configuration options for the worker.
@@ -47,14 +61,38 @@ type Config struct {
 	StreamName   string
 	GroupName    string
 	ConsumerName string
-	// ClaimIdleMs is the pending-message idle threshold in milliseconds used for
-	// crash recovery (XAUTOCLAIM). 0 disables crash recovery. Default: 60000 (60 s).
+
+	// ClaimIdleMs is the pending-message idle threshold in milliseconds used
+	// for crash recovery (XAUTOCLAIM). 0 disables crash recovery.
 	ClaimIdleMs int64
+
+	// LockTTLSeconds is the processing-lock TTL in seconds. When a worker holds
+	// the lock and crashes, the lock expires after this duration, allowing
+	// XAUTOCLAIM to trigger a retry. Default: 120 s.
+	LockTTLSeconds int64
+
+	// DoneTTLSeconds is the TTL of the "successfully processed" marker in Redis.
+	// Events processed within this window won't be reprocessed. Default: 86400 s.
+	DoneTTLSeconds int64
+
+	// BatchSize is the maximum number of messages fetched per ReadGroup /
+	// ClaimPending call. Default: 10.
+	BatchSize int64
 }
 
-// NewWorker initializes a processing worker.
+const (
+	defaultLockTTLSeconds = 120
+	defaultDoneTTLSeconds = 86400
+	defaultBatchSize      = 10
+)
+
+// NewWorker initialises a processing worker.
+//
+// idempotency may be nil only in tests that explicitly opt out of idempotency;
+// in production always supply a RedisIdempotencyStore.
 func NewWorker(
 	buf buffer.RawBuffer,
+	idempotency buffer.IdempotencyStore,
 	rawStore raw.RawEventStore,
 	detector detection.Detector,
 	driftDetector detection.DriftDetector,
@@ -72,9 +110,19 @@ func NewWorker(
 	if cfg.ConsumerName == "" {
 		cfg.ConsumerName = "worker-1"
 	}
+	if cfg.LockTTLSeconds == 0 {
+		cfg.LockTTLSeconds = defaultLockTTLSeconds
+	}
+	if cfg.DoneTTLSeconds == 0 {
+		cfg.DoneTTLSeconds = defaultDoneTTLSeconds
+	}
+	if cfg.BatchSize == 0 {
+		cfg.BatchSize = defaultBatchSize
+	}
 
 	w := &Worker{
 		buffer:        buf,
+		idempotency:   idempotency,
 		rawStore:      rawStore,
 		detector:      detector,
 		driftDetector: driftDetector,
@@ -84,6 +132,9 @@ func NewWorker(
 		streamName:    cfg.StreamName,
 		groupName:     cfg.GroupName,
 		consumerName:  cfg.ConsumerName,
+		lockTTL:       time.Duration(cfg.LockTTLSeconds) * time.Second,
+		doneTTL:       time.Duration(cfg.DoneTTLSeconds) * time.Second,
+		batchSize:     cfg.BatchSize,
 	}
 
 	if cfg.ClaimIdleMs > 0 {
@@ -93,9 +144,11 @@ func NewWorker(
 	return w
 }
 
-// ProcessSingleEvent executes the immutable raw store copy and full processing pipeline for one event.
+// ProcessSingleEvent executes the immutable raw store copy and full processing
+// pipeline for one event. It does NOT perform idempotency checks — those are
+// handled by the caller (processSingleMessageIdempotent).
 func (w *Worker) ProcessSingleEvent(ctx context.Context, rawEvent models.RawEvent) (*PipelineResult, error) {
-	// 1. Immutable Raw Event Store (Side-branch)
+	// 1. Immutable Raw Event Store (side-branch; path: raw-events/{event_id}.json)
 	if w.rawStore != nil {
 		if err := w.rawStore.Put(ctx, &rawEvent); err != nil {
 			log.Printf("[Worker] Warning: failed to persist raw event %s to MinIO: %v", rawEvent.EventID, err)
@@ -105,7 +158,7 @@ func (w *Worker) ProcessSingleEvent(ctx context.Context, rawEvent models.RawEven
 	// 2. Format / Source Detection
 	detectionRes := w.detector.Detect(rawEvent.Payload, rawEvent.Format)
 
-	// 3. Drift Analysis (MVP deterministic check)
+	// 3. Drift Analysis
 	driftRes, err := w.driftDetector.Analyze(ctx, rawEvent, detectionRes)
 	if err != nil {
 		log.Printf("[Worker] Drift analysis error for event %s: %v", rawEvent.EventID, err)
@@ -169,16 +222,19 @@ func (w *Worker) ProcessSingleEvent(ctx context.Context, rawEvent models.RawEven
 
 // Start runs the continuous worker consumer loop until context cancellation.
 //
-// Crash recovery: when ClaimIdleMs > 0, the loop periodically calls ClaimPending
-// (XAUTOCLAIM) to reclaim messages that were delivered to a crashed consumer and
-// never acknowledged. The reclaim interval is half the idle threshold.
+// Crash recovery: when ClaimIdleMs > 0, the loop periodically calls
+// ClaimPending (XAUTOCLAIM) to reclaim messages orphaned by crashed workers.
+//
+// Idempotency: each message goes through processSingleMessageIdempotent which
+// uses Redis SET NX to ensure at-most-once side-effects despite at-least-once
+// Redis Streams delivery.
 func (w *Worker) Start(ctx context.Context) error {
 	if err := w.buffer.EnsureGroup(ctx, w.streamName, w.groupName); err != nil {
 		return fmt.Errorf("failed to ensure consumer group: %w", err)
 	}
 
-	log.Printf("[Worker] Listening on stream %q (group: %q, consumer: %q)",
-		w.streamName, w.groupName, w.consumerName)
+	log.Printf("[Worker] Listening on stream %q (group: %q, consumer: %q, batch: %d)",
+		w.streamName, w.groupName, w.consumerName, w.batchSize)
 
 	// Schedule the first pending-message reclaim check.
 	var nextClaimAt time.Time
@@ -186,6 +242,11 @@ func (w *Worker) Start(ctx context.Context) error {
 		nextClaimAt = time.Now().Add(w.claimIdleTime / 2)
 		log.Printf("[Worker] Crash recovery enabled: reclaiming messages idle >%s (check every %s)",
 			w.claimIdleTime, w.claimIdleTime/2)
+	}
+
+	if w.idempotency != nil {
+		log.Printf("[Worker] Idempotency enabled: lock TTL=%s, done TTL=%s",
+			w.lockTTL, w.doneTTL)
 	}
 
 	for {
@@ -200,7 +261,7 @@ func (w *Worker) Start(ctx context.Context) error {
 		if w.claimIdleTime > 0 && time.Now().After(nextClaimAt) {
 			nextClaimAt = time.Now().Add(w.claimIdleTime / 2)
 			pending, claimErr := w.buffer.ClaimPending(
-				ctx, w.streamName, w.groupName, w.consumerName, w.claimIdleTime, 10)
+				ctx, w.streamName, w.groupName, w.consumerName, w.claimIdleTime, w.batchSize)
 			if claimErr != nil {
 				log.Printf("[Worker] Error claiming pending messages: %v", claimErr)
 			} else if len(pending) > 0 {
@@ -210,7 +271,7 @@ func (w *Worker) Start(ctx context.Context) error {
 		}
 
 		// --- Normal consumption of new messages ---
-		messages, err := w.buffer.ReadGroup(ctx, w.streamName, w.groupName, w.consumerName, 10, 2*time.Second)
+		messages, err := w.buffer.ReadGroup(ctx, w.streamName, w.groupName, w.consumerName, w.batchSize, 2*time.Second)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -224,22 +285,90 @@ func (w *Worker) Start(ctx context.Context) error {
 	}
 }
 
-// processMessages runs each message through the pipeline and ACKs it.
-// It mirrors the previous inline loop so the behaviour is identical whether
-// messages came from ReadGroup or ClaimPending.
+// processMessages routes each message through idempotency-aware processing.
 func (w *Worker) processMessages(ctx context.Context, messages []buffer.RawMessage) {
 	for _, msg := range messages {
 		if ctx.Err() != nil {
 			return
 		}
-		_, processErr := w.ProcessSingleEvent(ctx, msg.Event)
-		if processErr != nil {
-			log.Printf("[Worker] Error processing message %s (event %s): %v", msg.ID, msg.Event.EventID, processErr)
+		w.processSingleMessageIdempotent(ctx, msg)
+	}
+}
+
+// processSingleMessageIdempotent enforces at-most-once processing semantics on
+// top of Redis Streams' at-least-once delivery guarantee.
+//
+// Decision tree:
+//
+//  1. IsDone  → true:  already processed → skip side-effects, ACK
+//  2. TryClaimProcessing → false: another worker has the lock → skip without ACK
+//  3. TryClaimProcessing → true:  this worker owns the event
+//     a. ProcessSingleEvent → error: release lock, do NOT ACK (XAUTOCLAIM retries)
+//     b. ProcessSingleEvent → ok:   MarkDone, ACK
+//
+// When idempotency is nil (test mode / opt-out), falls back to the simple
+// process+ACK path identical to the previous P0 behaviour.
+func (w *Worker) processSingleMessageIdempotent(ctx context.Context, msg buffer.RawMessage) {
+	eventID := msg.Event.EventID
+
+	// ── Idempotency checks ───────────────────────────────────────────────────
+	if w.idempotency != nil {
+		// Fast path: event was already successfully processed — skip side-effects.
+		done, err := w.idempotency.IsDone(ctx, eventID)
+		if err != nil {
+			log.Printf("[Worker] Warning: idempotency IsDone check failed for %s: %v (proceeding)", eventID, err)
+			// Degraded mode: continue without idempotency guarantees if Redis is unavailable.
+		} else if done {
+			log.Printf("[Worker] Event %s already processed, skipping duplicate (ACK)", eventID)
+			w.ack(ctx, msg)
+			return
 		}
 
-		// Acknowledge processed message in Redis (matches existing ACK-even-on-error semantics).
-		if err := w.buffer.Ack(ctx, w.streamName, w.groupName, msg.ID); err != nil {
-			log.Printf("[Worker] Failed to ack message %s: %v", msg.ID, err)
+		// Atomic gate: only one worker may proceed past this point for a given eventID.
+		claimed, err := w.idempotency.TryClaimProcessing(ctx, eventID, w.lockTTL)
+		if err != nil {
+			log.Printf("[Worker] Warning: idempotency claim failed for %s: %v (proceeding without lock)", eventID, err)
+			// Degraded mode: treat as claimed so we don't loop indefinitely.
+			claimed = true
 		}
+		if !claimed {
+			// Another worker holds the processing lock.
+			// Do NOT ACK — message stays in this consumer's PEL and will be
+			// reclaimed by XAUTOCLAIM once the lock expires (after lockTTL).
+			log.Printf("[Worker] Event %s locked by another worker, skipping without ACK", eventID)
+			return
+		}
+	}
+
+	// ── Pipeline ─────────────────────────────────────────────────────────────
+	_, processErr := w.ProcessSingleEvent(ctx, msg.Event)
+
+	if processErr != nil {
+		log.Printf("[Worker] Error processing event %s (msg %s): %v", eventID, msg.ID, processErr)
+		if w.idempotency != nil {
+			// Release the processing lock so another worker can retry via XAUTOCLAIM.
+			if err := w.idempotency.ReleaseProcessing(ctx, eventID); err != nil {
+				log.Printf("[Worker] Warning: failed to release processing lock for %s: %v", eventID, err)
+			}
+		}
+		// Do NOT ACK — message stays in PEL for XAUTOCLAIM-triggered retry.
+		return
+	}
+
+	// ── Mark done + ACK ──────────────────────────────────────────────────────
+	if w.idempotency != nil {
+		if err := w.idempotency.MarkDone(ctx, eventID, w.doneTTL); err != nil {
+			log.Printf("[Worker] Warning: failed to mark event %s as done: %v", eventID, err)
+			// ACK anyway — event was processed successfully even if we can't record it.
+		}
+	}
+
+	w.ack(ctx, msg)
+}
+
+// ack sends XACK for msg, logging any error.
+func (w *Worker) ack(ctx context.Context, msg buffer.RawMessage) {
+	if err := w.buffer.Ack(ctx, w.streamName, w.groupName, msg.ID); err != nil {
+		log.Printf("[Worker] Failed to ack message %s: %v", msg.ID, err)
 	}
 }

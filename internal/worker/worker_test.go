@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,6 +16,8 @@ import (
 	"github.com/Krishiv-Mahajan/LogMorph/internal/validation"
 )
 
+// ── Mock RawBuffer ────────────────────────────────────────────────────────────
+
 type mockWorkerBuffer struct {
 	messages        []buffer.RawMessage
 	pendingMessages []buffer.RawMessage
@@ -22,15 +25,11 @@ type mockWorkerBuffer struct {
 	claimCalled     bool
 }
 
-func (m *mockWorkerBuffer) PublishRaw(ctx context.Context, stream string, event *models.RawEvent) (string, error) {
+func (m *mockWorkerBuffer) PublishRaw(_ context.Context, _ string, _ *models.RawEvent) (string, error) {
 	return "mock_id", nil
 }
-
-func (m *mockWorkerBuffer) EnsureGroup(ctx context.Context, stream string, group string) error {
-	return nil
-}
-
-func (m *mockWorkerBuffer) ReadGroup(ctx context.Context, stream, group, consumer string, count int64, block time.Duration) ([]buffer.RawMessage, error) {
+func (m *mockWorkerBuffer) EnsureGroup(_ context.Context, _, _ string) error { return nil }
+func (m *mockWorkerBuffer) ReadGroup(_ context.Context, _, _, _ string, _ int64, _ time.Duration) ([]buffer.RawMessage, error) {
 	if len(m.messages) > 0 {
 		msgs := m.messages
 		m.messages = nil
@@ -39,13 +38,11 @@ func (m *mockWorkerBuffer) ReadGroup(ctx context.Context, stream, group, consume
 	time.Sleep(50 * time.Millisecond)
 	return nil, nil
 }
-
-func (m *mockWorkerBuffer) Ack(ctx context.Context, stream, group string, ids ...string) error {
+func (m *mockWorkerBuffer) Ack(_ context.Context, _, _ string, ids ...string) error {
 	m.acked = append(m.acked, ids...)
 	return nil
 }
-
-func (m *mockWorkerBuffer) ClaimPending(ctx context.Context, stream, group, consumer string, minIdleTime time.Duration, count int64) ([]buffer.RawMessage, error) {
+func (m *mockWorkerBuffer) ClaimPending(_ context.Context, _, _, _ string, _ time.Duration, _ int64) ([]buffer.RawMessage, error) {
 	m.claimCalled = true
 	if len(m.pendingMessages) > 0 {
 		msgs := m.pendingMessages
@@ -54,23 +51,86 @@ func (m *mockWorkerBuffer) ClaimPending(ctx context.Context, stream, group, cons
 	}
 	return nil, nil
 }
+func (m *mockWorkerBuffer) Ping(_ context.Context) error { return nil }
+func (m *mockWorkerBuffer) Close() error                 { return nil }
 
-func (m *mockWorkerBuffer) Ping(ctx context.Context) error {
+// ── Mock IdempotencyStore ─────────────────────────────────────────────────────
+
+// mockIdempotencyStore is configurable for testing specific idempotency paths.
+// By default TryClaimProcessing succeeds and IsDone returns false.
+type mockIdempotencyStore struct {
+	mu sync.Mutex
+
+	// Pre-configure IsDone for specific eventIDs (true = already done).
+	doneEvents map[string]bool
+	// Pre-configure TryClaimProcessing for specific eventIDs (false = lock held).
+	claimBlocked map[string]bool
+
+	// Tracking fields (inspected in assertions).
+	claimAttempted  []string
+	releasedKeys    []string
+	markedDoneKeys  []string
+}
+
+func newMockIdempotencyStore() *mockIdempotencyStore {
+	return &mockIdempotencyStore{
+		doneEvents:   make(map[string]bool),
+		claimBlocked: make(map[string]bool),
+	}
+}
+
+func (m *mockIdempotencyStore) IsDone(_ context.Context, eventID string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.doneEvents[eventID], nil
+}
+
+func (m *mockIdempotencyStore) TryClaimProcessing(_ context.Context, eventID string, _ time.Duration) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.claimAttempted = append(m.claimAttempted, eventID)
+	if m.claimBlocked[eventID] {
+		return false, nil
+	}
+	return true, nil
+}
+
+func (m *mockIdempotencyStore) ReleaseProcessing(_ context.Context, eventID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.releasedKeys = append(m.releasedKeys, eventID)
 	return nil
 }
 
-func (m *mockWorkerBuffer) Close() error {
+func (m *mockIdempotencyStore) MarkDone(_ context.Context, eventID string, _ time.Duration) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.markedDoneKeys = append(m.markedDoneKeys, eventID)
+	m.doneEvents[eventID] = true
 	return nil
 }
 
-func setupTestWorker(mockBuf *mockWorkerBuffer, rawStore raw.RawEventStore) (*Worker, error) {
-	detector := detection.NewDetector()
-	driftDetector := detection.NewDriftDetector()
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+func buildParserEngine() parsing.Engine {
 	registry := parsing.NewRegistry()
 	registry.Register(parsers.NewSyslogParser())
 	registry.Register(parsers.NewJSONParser())
 	registry.Register(parsers.NewCSVParser())
-	parserEngine := parsing.NewEngine(registry)
+	return parsing.NewEngine(registry)
+}
+
+// setupTestWorker creates a worker with a MemoryIdempotencyStore (fully
+// functional, no real Redis needed) and all parsers registered.
+func setupTestWorker(mockBuf *mockWorkerBuffer, rawStore raw.RawEventStore) (*Worker, error) {
+	return setupTestWorkerWithIdempotency(mockBuf, rawStore, buffer.NewMemoryIdempotencyStore())
+}
+
+func setupTestWorkerWithIdempotency(
+	mockBuf *mockWorkerBuffer,
+	rawStore raw.RawEventStore,
+	idempotency buffer.IdempotencyStore,
+) (*Worker, error) {
 	normalizer := normalization.NewNormalizer()
 	validator, err := validation.NewValidator("")
 	if err != nil {
@@ -79,10 +139,11 @@ func setupTestWorker(mockBuf *mockWorkerBuffer, rawStore raw.RawEventStore) (*Wo
 
 	w := NewWorker(
 		mockBuf,
+		idempotency,
 		rawStore,
-		detector,
-		driftDetector,
-		parserEngine,
+		detection.NewDetector(),
+		detection.NewDriftDetector(),
+		buildParserEngine(),
 		normalizer,
 		validator,
 		Config{
@@ -94,21 +155,26 @@ func setupTestWorker(mockBuf *mockWorkerBuffer, rawStore raw.RawEventStore) (*Wo
 	return w, nil
 }
 
+// syslogMsg returns a realistic test RawMessage.
+func syslogMsg(id, eventID string) buffer.RawMessage {
+	return buffer.RawMessage{
+		ID: id,
+		Event: models.RawEvent{
+			EventID:    eventID,
+			ReceivedAt: time.Now().UTC().Format(time.RFC3339),
+			Format:     "syslog",
+			Source:     "firewall-01",
+			Payload:    "Aug 28 18:30:12 firewall01 DENY TCP SRC=192.168.1.20:54321 DST=10.0.0.15:443",
+		},
+	}
+}
+
+// ── Existing tests (unchanged behaviour) ────────────────────────────────────
+
 func TestWorker_FullPipelineAndStorage(t *testing.T) {
 	rawStore := raw.NewMemoryRawStore()
 	mockBuf := &mockWorkerBuffer{
-		messages: []buffer.RawMessage{
-			{
-				ID: "1670000000000-0",
-				Event: models.RawEvent{
-					EventID:    "evt_test_syslog",
-					ReceivedAt: time.Now().UTC().Format(time.RFC3339),
-					Format:     "syslog",
-					Source:     "firewall-01",
-					Payload:    "Aug 28 18:30:12 firewall01 DENY TCP SRC=192.168.1.20:54321 DST=10.0.0.15:443",
-				},
-			},
-		},
+		messages: []buffer.RawMessage{syslogMsg("1670000000000-0", "evt_test_syslog")},
 	}
 
 	w, err := setupTestWorker(mockBuf, rawStore)
@@ -121,12 +187,10 @@ func TestWorker_FullPipelineAndStorage(t *testing.T) {
 
 	_ = w.Start(ctx)
 
-	// 1. Verify Redis Message was acknowledged
 	if len(mockBuf.acked) != 1 || mockBuf.acked[0] != "1670000000000-0" {
 		t.Errorf("expected message acked, got: %v", mockBuf.acked)
 	}
 
-	// 2. Verify Raw Event was stored immutably in RawEventStore
 	storedRaw, err := rawStore.Get(context.Background(), "evt_test_syslog")
 	if err != nil {
 		t.Fatalf("expected raw event stored in RawEventStore: %v", err)
@@ -136,9 +200,7 @@ func TestWorker_FullPipelineAndStorage(t *testing.T) {
 	}
 }
 
-// TestWorker_ClaimsPendingOnRecovery verifies that when ClaimIdleMs > 0 the worker
-// calls ClaimPending, processes the returned messages through the full pipeline,
-// ACKs them, and stores the exact original payload in the raw event store.
+// TestWorker_ClaimsPendingOnRecovery verifies XAUTOCLAIM crash recovery path.
 func TestWorker_ClaimsPendingOnRecovery(t *testing.T) {
 	const payload = "Aug 28 18:30:12 firewall01 DENY TCP SRC=192.168.1.20:54321 DST=10.0.0.15:443"
 
@@ -153,20 +215,9 @@ func TestWorker_ClaimsPendingOnRecovery(t *testing.T) {
 		},
 	}
 
-	// Buffer starts empty (no new messages); the pending message simulates a
-	// message left behind by a crashed worker.
-	mockBuf := &mockWorkerBuffer{
-		pendingMessages: []buffer.RawMessage{pendingMsg},
-	}
+	mockBuf := &mockWorkerBuffer{pendingMessages: []buffer.RawMessage{pendingMsg}}
 	rawStore := raw.NewMemoryRawStore()
 
-	detector := detection.NewDetector()
-	driftDetector := detection.NewDriftDetector()
-	registry := parsing.NewRegistry()
-	registry.Register(parsers.NewSyslogParser())
-	registry.Register(parsers.NewJSONParser())
-	registry.Register(parsers.NewCSVParser())
-	parserEngine := parsing.NewEngine(registry)
 	normalizer := normalization.NewNormalizer()
 	validator, err := validation.NewValidator("")
 	if err != nil {
@@ -175,18 +226,18 @@ func TestWorker_ClaimsPendingOnRecovery(t *testing.T) {
 
 	w := NewWorker(
 		mockBuf,
+		buffer.NewMemoryIdempotencyStore(),
 		rawStore,
-		detector,
-		driftDetector,
-		parserEngine,
+		detection.NewDetector(),
+		detection.NewDriftDetector(),
+		buildParserEngine(),
 		normalizer,
 		validator,
 		Config{
 			StreamName:   "raw_events",
 			GroupName:    "test-group",
 			ConsumerName: "test-worker",
-			// 1 ms idle threshold so the claim fires immediately in the test.
-			ClaimIdleMs: 1,
+			ClaimIdleMs:  1,
 		},
 	)
 
@@ -195,25 +246,268 @@ func TestWorker_ClaimsPendingOnRecovery(t *testing.T) {
 
 	_ = w.Start(ctx)
 
-	// 1. Verify ClaimPending was called.
 	if !mockBuf.claimCalled {
-		t.Error("expected ClaimPending to be called for crash recovery, but it was not")
+		t.Error("expected ClaimPending to be called for crash recovery")
 	}
-
-	// 2. Verify the reclaimed message was acknowledged.
 	if len(mockBuf.acked) == 0 {
-		t.Fatalf("expected pending message to be ACKed after recovery, acked list is empty")
+		t.Fatalf("expected pending message to be ACKed after recovery")
 	}
 	if mockBuf.acked[0] != pendingMsg.ID {
 		t.Errorf("expected ACKed ID %q, got %q", pendingMsg.ID, mockBuf.acked[0])
 	}
 
-	// 3. Verify exact raw payload was preserved in the immutable raw store.
 	stored, err := rawStore.Get(context.Background(), "evt_crash_recovery_test")
 	if err != nil {
 		t.Fatalf("expected raw event in store after recovery: %v", err)
 	}
 	if stored.Payload != payload {
 		t.Errorf("raw payload corrupted: expected %q, got %q", payload, stored.Payload)
+	}
+}
+
+// ── Idempotency tests ─────────────────────────────────────────────────────────
+
+// TestIdempotency_FirstDeliveryIsProcessed — first delivery goes through
+// the full pipeline, is marked done, and is ACKed.
+func TestIdempotency_FirstDeliveryIsProcessed(t *testing.T) {
+	mockBuf := &mockWorkerBuffer{
+		messages: []buffer.RawMessage{syslogMsg("msg-1", "evt_first")},
+	}
+	idempotency := newMockIdempotencyStore()
+	rawStore := raw.NewMemoryRawStore()
+
+	w, err := setupTestWorkerWithIdempotency(mockBuf, rawStore, idempotency)
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_ = w.Start(ctx)
+
+	// Event must be ACKed.
+	if len(mockBuf.acked) == 0 {
+		t.Fatal("expected event to be ACKed on first delivery")
+	}
+	// Done must be marked.
+	if len(idempotency.markedDoneKeys) == 0 || idempotency.markedDoneKeys[0] != "evt_first" {
+		t.Errorf("expected MarkDone called with evt_first, got %v", idempotency.markedDoneKeys)
+	}
+	// Raw store must contain the original payload.
+	stored, err := rawStore.Get(context.Background(), "evt_first")
+	if err != nil {
+		t.Fatalf("raw event not in store: %v", err)
+	}
+	if stored.Payload != "Aug 28 18:30:12 firewall01 DENY TCP SRC=192.168.1.20:54321 DST=10.0.0.15:443" {
+		t.Errorf("raw payload mismatch: %s", stored.Payload)
+	}
+}
+
+// TestIdempotency_DuplicateDeliveryIsSkipped — when a message is re-delivered
+// but IsDone returns true, the worker skips the side-effects and ACKs.
+func TestIdempotency_DuplicateDeliveryIsSkipped(t *testing.T) {
+	mockBuf := &mockWorkerBuffer{
+		messages: []buffer.RawMessage{syslogMsg("msg-2", "evt_dup")},
+	}
+	idempotency := newMockIdempotencyStore()
+	idempotency.doneEvents["evt_dup"] = true // pre-mark as done
+
+	rawStore := raw.NewMemoryRawStore()
+
+	w, err := setupTestWorkerWithIdempotency(mockBuf, rawStore, idempotency)
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_ = w.Start(ctx)
+
+	// Duplicate must be ACKed (to clear it from the PEL).
+	if len(mockBuf.acked) == 0 {
+		t.Fatal("expected duplicate to be ACKed")
+	}
+	// But the raw store must NOT contain a new entry (no side-effects).
+	_, err = rawStore.Get(context.Background(), "evt_dup")
+	if err == nil {
+		t.Error("expected no raw store entry for duplicate (side-effects must be skipped)")
+	}
+	// TryClaimProcessing must NOT have been called — IsDone short-circuits.
+	if len(idempotency.claimAttempted) != 0 {
+		t.Errorf("expected no claim attempt for duplicate, got %v", idempotency.claimAttempted)
+	}
+}
+
+// TestIdempotency_LockConflictSkipsWithoutACK — when the processing lock is
+// held by another worker, this worker skips the message WITHOUT ACKing it
+// (so XAUTOCLAIM can re-deliver after the lock expires).
+func TestIdempotency_LockConflictSkipsWithoutACK(t *testing.T) {
+	msg := syslogMsg("msg-3", "evt_locked")
+	mockBuf := &mockWorkerBuffer{
+		messages: []buffer.RawMessage{msg},
+	}
+	idempotency := newMockIdempotencyStore()
+	idempotency.claimBlocked["evt_locked"] = true // simulate another worker holding the lock
+
+	rawStore := raw.NewMemoryRawStore()
+	w, err := setupTestWorkerWithIdempotency(mockBuf, rawStore, idempotency)
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_ = w.Start(ctx)
+
+	// Must NOT ACK — message must stay in PEL for XAUTOCLAIM retry.
+	if len(mockBuf.acked) != 0 {
+		t.Errorf("expected NO ACK when lock is held by another worker, got %v", mockBuf.acked)
+	}
+	// Must NOT appear in raw store (no processing).
+	_, err = rawStore.Get(context.Background(), "evt_locked")
+	if err == nil {
+		t.Error("expected no raw store entry when lock is held")
+	}
+}
+
+// TestIdempotency_FailureReleasesLockAndNoACK — when processing fails (no
+// parser registered), the processing lock is released and the message is
+// NOT ACKed so XAUTOCLAIM can retry.
+func TestIdempotency_FailureReleasesLockAndNoACK(t *testing.T) {
+	msg := buffer.RawMessage{
+		ID: "msg-4",
+		Event: models.RawEvent{
+			EventID:    "evt_fail",
+			ReceivedAt: time.Now().UTC().Format(time.RFC3339),
+			Format:     "unknown_format", // no parser registered → engine returns error
+			Source:     "test",
+			Payload:    "some raw log data",
+		},
+	}
+
+	mockBuf := &mockWorkerBuffer{messages: []buffer.RawMessage{msg}}
+	idempotency := newMockIdempotencyStore()
+	rawStore := raw.NewMemoryRawStore()
+
+	normalizer := normalization.NewNormalizer()
+	validator, err := validation.NewValidator("")
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	// Intentionally empty registry — no parser for "unknown_format".
+	emptyRegistry := parsing.NewRegistry()
+	emptyEngine := parsing.NewEngine(emptyRegistry)
+
+	w := NewWorker(
+		mockBuf,
+		idempotency,
+		rawStore,
+		detection.NewDetector(),
+		detection.NewDriftDetector(),
+		emptyEngine,
+		normalizer,
+		validator,
+		Config{
+			StreamName:   "raw_events",
+			GroupName:    "test-group",
+			ConsumerName: "test-worker",
+		},
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_ = w.Start(ctx)
+
+	// Must NOT ACK — message should remain in PEL for retry.
+	if len(mockBuf.acked) != 0 {
+		t.Errorf("expected NO ACK on processing failure, got %v", mockBuf.acked)
+	}
+	// Processing lock must be released so another worker can retry.
+	if len(idempotency.releasedKeys) == 0 || idempotency.releasedKeys[0] != "evt_fail" {
+		t.Errorf("expected ReleaseProcessing called with evt_fail, got %v", idempotency.releasedKeys)
+	}
+	// MarkDone must NOT be called on failure.
+	if len(idempotency.markedDoneKeys) != 0 {
+		t.Errorf("expected MarkDone NOT called on failure, got %v", idempotency.markedDoneKeys)
+	}
+}
+
+// TestIdempotency_SuccessfulProcessingPreventsReprocessing — after the first
+// successful processing (MarkDone), a second delivery of the same event is
+// skipped.
+func TestIdempotency_SuccessfulProcessingPreventsReprocessing(t *testing.T) {
+	rawStore := raw.NewMemoryRawStore()
+	idempotency := buffer.NewMemoryIdempotencyStore() // real memory store — tracks state
+
+	// First delivery
+	mockBuf := &mockWorkerBuffer{
+		messages: []buffer.RawMessage{syslogMsg("msg-5a", "evt_dedup")},
+	}
+	w, err := setupTestWorkerWithIdempotency(mockBuf, rawStore, idempotency)
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel1()
+	_ = w.Start(ctx1)
+
+	if len(mockBuf.acked) != 1 {
+		t.Fatalf("expected 1st delivery to be ACKed, got %v", mockBuf.acked)
+	}
+
+	// Second delivery (same event_id, different stream message ID).
+	mockBuf2 := &mockWorkerBuffer{
+		messages: []buffer.RawMessage{syslogMsg("msg-5b", "evt_dedup")},
+	}
+	w2, err := setupTestWorkerWithIdempotency(mockBuf2, rawStore, idempotency)
+	if err != nil {
+		t.Fatalf("setup w2: %v", err)
+	}
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel2()
+	_ = w2.Start(ctx2)
+
+	// Second delivery must be ACKed (to clear PEL) but no new raw store entry.
+	if len(mockBuf2.acked) != 1 {
+		t.Errorf("expected 2nd delivery to be ACKed (skip+ACK), got %v", mockBuf2.acked)
+	}
+	done, _ := idempotency.IsDone(context.Background(), "evt_dedup")
+	if !done {
+		t.Error("expected IsDone=true after successful first processing")
+	}
+}
+
+// TestIdempotency_ConcurrentWorkers — two workers racing on the same event_id;
+// MemoryIdempotencyStore enforces SET NX semantics via mutex so exactly one
+// acquires the processing lock.
+func TestIdempotency_ConcurrentWorkers(t *testing.T) {
+	idempotency := buffer.NewMemoryIdempotencyStore()
+	eventID := "evt_concurrent"
+
+	const goroutines = 8
+	results := make([]bool, goroutines)
+	var wg sync.WaitGroup
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			ok, _ := idempotency.TryClaimProcessing(context.Background(), eventID, 5*time.Second)
+			results[idx] = ok
+		}(i)
+	}
+	wg.Wait()
+
+	successCount := 0
+	for _, r := range results {
+		if r {
+			successCount++
+		}
+	}
+	if successCount != 1 {
+		t.Errorf("expected exactly 1 goroutine to acquire processing lock, got %d", successCount)
 	}
 }

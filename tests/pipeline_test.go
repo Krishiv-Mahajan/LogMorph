@@ -90,6 +90,7 @@ func TestFullTargetArchitecture_E2E(t *testing.T) {
 
 	w := worker.NewWorker(
 		rawBuf,
+		buffer.NewMemoryIdempotencyStore(),
 		rawStore,
 		detector,
 		driftDetector,

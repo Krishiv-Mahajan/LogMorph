@@ -67,15 +67,26 @@ func main() {
 		claimIdleMs = 60000
 	}
 
+	// IDEMPOTENCY_LOCK_TTL_S is the TTL in seconds for the processing lock (default 120 s).
+	lockTTL, _ := strconv.ParseInt(os.Getenv("IDEMPOTENCY_LOCK_TTL_S"), 10, 64)
+
+	// IDEMPOTENCY_DONE_TTL_S is the TTL in seconds for the completed event marker (default 86400 s / 24 h).
+	doneTTL, _ := strconv.ParseInt(os.Getenv("IDEMPOTENCY_DONE_TTL_S"), 10, 64)
+
+	// WORKER_BATCH_SIZE is the max count of messages to fetch per read/claim (default 10).
+	batchSize, _ := strconv.ParseInt(os.Getenv("WORKER_BATCH_SIZE"), 10, 64)
+
 	log.Printf("[Worker] Initializing ULPF Processing Worker (Redis: %s, Stream: %s, Group: %s)...",
 		redisAddr, rawStream, groupName)
 
-	// 1. Redis Raw Stream Buffer
+	// 1. Redis Raw Stream Buffer & Idempotency Store
 	rawBuffer, err := buffer.NewRedisRawBuffer(redisAddr, redisPassword, 0, maxLen)
 	if err != nil {
 		log.Fatalf("[Worker] Failed to create Redis buffer client: %v", err)
 	}
 	defer rawBuffer.Close()
+
+	idempotencyStore := buffer.NewRedisIdempotencyStore(rawBuffer)
 
 	// Wait for Redis connection
 	for {
@@ -135,6 +146,7 @@ func main() {
 	// 7. Worker Instance
 	w := worker.NewWorker(
 		rawBuffer,
+		idempotencyStore,
 		rawStore,
 		detector,
 		driftDetector,
@@ -142,10 +154,13 @@ func main() {
 		normalizer,
 		validator,
 		worker.Config{
-			StreamName:   rawStream,
-			GroupName:    groupName,
-			ConsumerName: consumerName,
-			ClaimIdleMs:  claimIdleMs,
+			StreamName:     rawStream,
+			GroupName:      groupName,
+			ConsumerName:   consumerName,
+			ClaimIdleMs:    claimIdleMs,
+			LockTTLSeconds: lockTTL,
+			DoneTTLSeconds: doneTTL,
+			BatchSize:      batchSize,
 		},
 	)
 
