@@ -19,9 +19,10 @@ const (
 )
 
 var (
-	// Matches standard BSD syslog timestamp (e.g., "Aug 28 18:30:12") or ISO8601 prefix
+	// Matches standard BSD syslog timestamp (e.g., "Aug 28 18:30:12", "<134>Aug 28 18:30:12") or ISO8601 prefix
 	syslogTimestampRegex = regexp.MustCompile(`^(?:<\d+>)?(?:[A-Z][a-z]{2}\s+\d+\s+\d{2}:\d{2}:\d{2}|\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2})`)
-	syslogTokenRegex     = regexp.MustCompile(`(?i)\b(SRC|DST|SPT|DPT|PROTO|ACTION|DENY|ALLOW|ACCEPT|DROP)\b`)
+	// Matches standard firewall key-value pairs
+	syslogKVRegex = regexp.MustCompile(`(?i)\b(?:SRC|DST|SPT|DPT|PROTO|ACTION)=`)
 )
 
 // Detector defines the interface for detecting log formats and source types.
@@ -88,32 +89,37 @@ func (d *DefaultDetector) Detect(payload string, hint string) models.DetectionRe
 	}
 
 	// 2. CSV Detection
+	// Requires comma delimiter, at least 2 rows (header + data), uniform columns (>=2), and recognizable header names.
 	if strings.Contains(trimmed, ",") {
 		reader := csv.NewReader(bytes.NewBufferString(trimmed))
 		reader.TrimLeadingSpace = true
 		records, err := reader.ReadAll()
-		if err == nil && len(records) > 0 && len(records[0]) >= 2 {
+		if err == nil && len(records) >= 2 && len(records[0]) >= 2 && len(records[0]) == len(records[1]) {
 			hasHeaderSignals := false
 			for _, col := range records[0] {
 				c := strings.ToLower(strings.TrimSpace(col))
-				if c == "timestamp" || c == "action" || c == "protocol" || c == "src_ip" || c == "dst_ip" || c == "ip" {
+				if c == "timestamp" || c == "time" || c == "action" || c == "act" ||
+					c == "protocol" || c == "proto" || c == "src_ip" || c == "dst_ip" ||
+					c == "src_port" || c == "dst_port" || c == "source" || c == "severity" ||
+					c == "ip" {
 					hasHeaderSignals = true
 					break
 				}
 			}
-			if hasHeaderSignals || len(records) > 1 {
+			if hasHeaderSignals {
 				return models.DetectionResult{
 					Format:     FormatCSV,
 					SourceType: "firewall",
 					Confidence: 0.90,
-					Reason:     "CSV column structure detected",
+					Reason:     "CSV column structure with recognized headers detected",
 				}
 			}
 		}
 	}
 
 	// 3. Syslog Detection
-	if syslogTimestampRegex.MatchString(trimmed) || syslogTokenRegex.MatchString(trimmed) {
+	// Requires standard timestamp prefix or security KV pairs (e.g. SRC=, DST=, ACTION=)
+	if syslogTimestampRegex.MatchString(trimmed) || syslogKVRegex.MatchString(trimmed) {
 		return models.DetectionResult{
 			Format:     FormatSyslog,
 			SourceType: "firewall",
