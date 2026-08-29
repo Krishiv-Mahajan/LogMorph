@@ -20,6 +20,7 @@ import (
 // ── Mock RawBuffer ────────────────────────────────────────────────────────────
 
 type mockWorkerBuffer struct {
+	mu              sync.Mutex
 	messages        []buffer.RawMessage
 	pendingMessages []buffer.RawMessage
 	acked           []string
@@ -31,19 +32,26 @@ func (m *mockWorkerBuffer) PublishRaw(_ context.Context, _ string, _ *models.Raw
 }
 func (m *mockWorkerBuffer) EnsureGroup(_ context.Context, _, _ string) error { return nil }
 func (m *mockWorkerBuffer) ReadGroup(_ context.Context, _, _, _ string, _ int64, _ time.Duration) ([]buffer.RawMessage, error) {
+	m.mu.Lock()
 	if len(m.messages) > 0 {
 		msgs := m.messages
 		m.messages = nil
+		m.mu.Unlock()
 		return msgs, nil
 	}
+	m.mu.Unlock()
 	time.Sleep(50 * time.Millisecond)
 	return nil, nil
 }
 func (m *mockWorkerBuffer) Ack(_ context.Context, _, _ string, ids ...string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.acked = append(m.acked, ids...)
 	return nil
 }
 func (m *mockWorkerBuffer) ClaimPending(_ context.Context, _, _, _ string, _ time.Duration, _ int64) ([]buffer.RawMessage, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.claimCalled = true
 	if len(m.pendingMessages) > 0 {
 		msgs := m.pendingMessages
