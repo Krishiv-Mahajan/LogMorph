@@ -41,8 +41,8 @@ Heterogeneous devices (firewalls, routers, servers, cloud infrastructure) produc
        │ MinIO / S3   │                    │
        │ IMMUTABLE    │                    │
        └──────────────┘                    │
-                                            │
-                                            ▼
+                                           │
+                                           ▼
                               ┌────────────────────────┐
                               │ FORMAT / SOURCE        │
                               │ DETECTION              │
@@ -75,27 +75,27 @@ Heterogeneous devices (firewalls, routers, servers, cloud infrastructure) produc
                               └────────────┬───────────────
                                            ▼
                               ┌────────────────────────┐
-                              │    PARSER REGISTRY      │
-                              │      PostgreSQL         │
-                              │      Future phase       │
+                              │    PARSER REGISTRY     │
+                              │      PostgreSQL        │
+                              │      Future phase      │
                               └────────────┬───────────┘
                                            │
                                            ▼
                               ┌────────────────────────┐
-                              │     PARSER ENGINE       │
-                              │          GO             │
+                              │     PARSER ENGINE      │
+                              │          GO            │
                               └────────────┬───────────┘
                                            │
                                            ▼
                               ┌────────────────────────┐
-                              │     NORMALIZATION       │
-                              │          GO             │
+                              │     NORMALIZATION      │
+                              │          GO            │
                               └────────────┬───────────┘
                                            │
                                            ▼
                               ┌────────────────────────┐
-                              │       VALIDATION        │
-                              │     JSON Schema         │
+                              │       VALIDATION       │
+                              │     JSON Schema        │
                               └────────────┬───────────┘
                                            │
                                   ┌────────┴────────┐
