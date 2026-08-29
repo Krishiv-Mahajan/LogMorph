@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -56,15 +57,39 @@ func main() {
 	}
 	minioUseSSL := os.Getenv("MINIO_USE_SSL") == "true"
 
+	// RAW_EVENT_STREAM_MAXLEN caps the Redis stream length approximately (0 = unlimited).
+	maxLen, _ := strconv.ParseInt(os.Getenv("RAW_EVENT_STREAM_MAXLEN"), 10, 64)
+
+	// RAW_EVENT_CLAIM_IDLE_MS is the pending-message idle threshold for crash recovery.
+	// Defaults to 60000 ms (60 s). Set to 0 to disable crash recovery.
+	claimIdleMs, _ := strconv.ParseInt(os.Getenv("RAW_EVENT_CLAIM_IDLE_MS"), 10, 64)
+	if claimIdleMs == 0 {
+		claimIdleMs = 60000
+	}
+
+	// IDEMPOTENCY_LOCK_TTL_S is the TTL in seconds for the processing lock (default 120 s).
+	lockTTL, _ := strconv.ParseInt(os.Getenv("IDEMPOTENCY_LOCK_TTL_S"), 10, 64)
+
+	// IDEMPOTENCY_DONE_TTL_S is the TTL in seconds for the completed event marker (default 86400 s / 24 h).
+	doneTTL, _ := strconv.ParseInt(os.Getenv("IDEMPOTENCY_DONE_TTL_S"), 10, 64)
+
+	// WORKER_BATCH_SIZE is the max count of messages to fetch per read/claim (default 10).
+	batchSize, _ := strconv.ParseInt(os.Getenv("WORKER_BATCH_SIZE"), 10, 64)
+
+	// WORKER_CONCURRENCY is the max number of events processed in parallel (default 4).
+	concurrency, _ := strconv.ParseInt(os.Getenv("WORKER_CONCURRENCY"), 10, 64)
+
 	log.Printf("[Worker] Initializing ULPF Processing Worker (Redis: %s, Stream: %s, Group: %s)...",
 		redisAddr, rawStream, groupName)
 
-	// 1. Redis Raw Stream Buffer
-	rawBuffer, err := buffer.NewRedisRawBuffer(redisAddr, redisPassword, 0)
+	// 1. Redis Raw Stream Buffer & Idempotency Store
+	rawBuffer, err := buffer.NewRedisRawBuffer(redisAddr, redisPassword, 0, maxLen)
 	if err != nil {
 		log.Fatalf("[Worker] Failed to create Redis buffer client: %v", err)
 	}
 	defer rawBuffer.Close()
+
+	idempotencyStore := buffer.NewRedisIdempotencyStore(rawBuffer)
 
 	// Wait for Redis connection
 	for {
@@ -124,6 +149,7 @@ func main() {
 	// 7. Worker Instance
 	w := worker.NewWorker(
 		rawBuffer,
+		idempotencyStore,
 		rawStore,
 		detector,
 		driftDetector,
@@ -131,9 +157,14 @@ func main() {
 		normalizer,
 		validator,
 		worker.Config{
-			StreamName:   rawStream,
-			GroupName:    groupName,
-			ConsumerName: consumerName,
+			StreamName:     rawStream,
+			GroupName:      groupName,
+			ConsumerName:   consumerName,
+			ClaimIdleMs:    claimIdleMs,
+			LockTTLSeconds: lockTTL,
+			DoneTTLSeconds: doneTTL,
+			BatchSize:      batchSize,
+			Concurrency:    concurrency,
 		},
 	)
 

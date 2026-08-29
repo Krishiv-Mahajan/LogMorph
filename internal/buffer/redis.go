@@ -29,6 +29,10 @@ type RawBuffer interface {
 	EnsureGroup(ctx context.Context, stream string, group string) error
 	ReadGroup(ctx context.Context, stream, group, consumer string, count int64, block time.Duration) ([]RawMessage, error)
 	Ack(ctx context.Context, stream, group string, ids ...string) error
+	// ClaimPending reclaims messages that have been idle for longer than minIdleTime
+	// from any consumer in the group. Used for crash recovery when a worker dies
+	// before ACKing. Implemented via XAUTOCLAIM (requires Redis ≥ 6.2).
+	ClaimPending(ctx context.Context, stream, group, consumer string, minIdleTime time.Duration, count int64) ([]RawMessage, error)
 	Ping(ctx context.Context) error
 	Close() error
 }
@@ -36,17 +40,20 @@ type RawBuffer interface {
 // RedisRawBuffer implements RawBuffer backed by go-redis.
 type RedisRawBuffer struct {
 	client *goredis.Client
+	// maxLen caps the Redis stream length approximately. 0 means no limit.
+	maxLen int64
 }
 
 // NewRedisRawBuffer initializes a connection to Redis.
-func NewRedisRawBuffer(addr, password string, db int) (*RedisRawBuffer, error) {
+// maxLen sets the approximate stream retention cap (0 = unlimited).
+func NewRedisRawBuffer(addr, password string, db int, maxLen int64) (*RedisRawBuffer, error) {
 	rdb := goredis.NewClient(&goredis.Options{
 		Addr:     addr,
 		Password: password,
 		DB:       db,
 	})
 
-	return &RedisRawBuffer{client: rdb}, nil
+	return &RedisRawBuffer{client: rdb, maxLen: maxLen}, nil
 }
 
 // Ping checks if Redis is reachable.
@@ -55,6 +62,8 @@ func (r *RedisRawBuffer) Ping(ctx context.Context) error {
 }
 
 // PublishRaw serializes RawEvent and adds it to the raw_events Redis stream.
+// When maxLen > 0 the stream is approximately trimmed to that many entries
+// (XADD ... MAXLEN ~ maxLen ...) so Redis memory is bounded.
 func (r *RedisRawBuffer) PublishRaw(ctx context.Context, stream string, event *models.RawEvent) (string, error) {
 	if stream == "" {
 		stream = DefaultRawStreamName
@@ -65,14 +74,18 @@ func (r *RedisRawBuffer) PublishRaw(ctx context.Context, stream string, event *m
 		return "", fmt.Errorf("failed to marshal raw event: %w", err)
 	}
 
-	id, err := r.client.XAdd(ctx, &goredis.XAddArgs{
+	args := &goredis.XAddArgs{
 		Stream: stream,
+		// Approx trimming (MAXLEN ~) is cheap at write time; exact trimming is O(N).
+		MaxLen: r.maxLen,
+		Approx: r.maxLen > 0,
 		Values: map[string]interface{}{
 			"event_id": event.EventID,
 			"payload":  string(payloadJSON),
 		},
-	}).Result()
+	}
 
+	id, err := r.client.XAdd(ctx, args).Result()
 	if err != nil {
 		return "", fmt.Errorf("failed to XAdd to stream %s: %w", stream, err)
 	}
@@ -123,21 +136,57 @@ func (r *RedisRawBuffer) ReadGroup(ctx context.Context, stream, group, consumer 
 	var rawMessages []RawMessage
 	if len(streams) > 0 {
 		for _, msg := range streams[0].Messages {
-			payloadStr, ok := msg.Values["payload"].(string)
+			rm, ok := parseXMessage(msg)
 			if !ok {
 				continue
 			}
-
-			var rawEvent models.RawEvent
-			if err := json.Unmarshal([]byte(payloadStr), &rawEvent); err != nil {
-				continue
-			}
-
-			rawMessages = append(rawMessages, RawMessage{
-				ID:    msg.ID,
-				Event: rawEvent,
-			})
+			rawMessages = append(rawMessages, rm)
 		}
+	}
+
+	return rawMessages, nil
+}
+
+// ClaimPending uses XAUTOCLAIM to reclaim messages that have been idle for longer
+// than minIdleTime across the consumer group. This recovers events that were
+// delivered to a crashed worker that never sent XACK.
+//
+// The caller should supply "0-0" semantics are handled internally; each call
+// scans from the beginning of the pending list so no cursor state is required
+// for the MVP use-case.
+func (r *RedisRawBuffer) ClaimPending(ctx context.Context, stream, group, consumer string, minIdleTime time.Duration, count int64) ([]RawMessage, error) {
+	if stream == "" {
+		stream = DefaultRawStreamName
+	}
+	if group == "" {
+		group = DefaultGroupName
+	}
+
+	// XAutoClaim scans the pending-entries list (PEL) and reassigns messages that
+	// have been idle for > minIdleTime to the named consumer.
+	messages, _, err := r.client.XAutoClaim(ctx, &goredis.XAutoClaimArgs{
+		Stream:   stream,
+		Group:    group,
+		Consumer: consumer,
+		MinIdle:  minIdleTime,
+		Start:    "0-0", // always scan from the start of the PEL
+		Count:    count,
+	}).Result()
+
+	if err != nil {
+		if err == goredis.Nil {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("XAUTOCLAIM failed on stream %s: %w", stream, err)
+	}
+
+	var rawMessages []RawMessage
+	for _, msg := range messages {
+		rm, ok := parseXMessage(msg)
+		if !ok {
+			continue
+		}
+		rawMessages = append(rawMessages, rm)
 	}
 
 	return rawMessages, nil
@@ -157,4 +206,18 @@ func (r *RedisRawBuffer) Ack(ctx context.Context, stream, group string, ids ...s
 // Close closes the Redis connection.
 func (r *RedisRawBuffer) Close() error {
 	return r.client.Close()
+}
+
+// parseXMessage extracts a RawMessage from a raw Redis XMessage.
+// Returns (msg, true) on success; (zero, false) if the message is malformed.
+func parseXMessage(msg goredis.XMessage) (RawMessage, bool) {
+	payloadStr, ok := msg.Values["payload"].(string)
+	if !ok {
+		return RawMessage{}, false
+	}
+	var rawEvent models.RawEvent
+	if err := json.Unmarshal([]byte(payloadStr), &rawEvent); err != nil {
+		return RawMessage{}, false
+	}
+	return RawMessage{ID: msg.ID, Event: rawEvent}, true
 }

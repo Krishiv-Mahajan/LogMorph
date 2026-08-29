@@ -34,6 +34,10 @@ func (m *mockRawBuffer) Ack(ctx context.Context, stream, group string, ids ...st
 	return nil
 }
 
+func (m *mockRawBuffer) ClaimPending(ctx context.Context, stream, group, consumer string, minIdleTime time.Duration, count int64) ([]buffer.RawMessage, error) {
+	return nil, nil
+}
+
 func (m *mockRawBuffer) Ping(ctx context.Context) error {
 	return nil
 }
@@ -91,5 +95,105 @@ func TestHandler_EmptyPayload(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("expected 400 Bad Request, got %d", rec.Code)
+	}
+}
+
+func TestHandler_BatchIngest_Success(t *testing.T) {
+	mockBuf := &mockRawBuffer{}
+	service := NewService(mockBuf, "raw_events")
+	handler := NewHandler(service)
+
+	batchPayload := `[
+		{"format":"syslog","source":"firewall-01","payload":"Aug 28 18:30:12 firewall01 DENY TCP SRC=10.0.0.1 DST=8.8.8.8"},
+		{"format":"json","source":"waf-01","payload":"{\"action\":\"block\",\"ip\":\"1.2.3.4\"}"},
+		{"format":"csv","source":"router-01","payload":"2026-08-28,router-01,drop,10.0.0.5,10.0.0.6"}
+	]`
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/ingest/batch", bytes.NewBufferString(batchPayload))
+	handler.HandleIngestBatch(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var resp BatchIngestResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode batch response: %v", err)
+	}
+
+	if resp.Status != "accepted" {
+		t.Errorf("expected status 'accepted', got %q", resp.Status)
+	}
+	if resp.Count != 3 {
+		t.Errorf("expected count 3, got %d", resp.Count)
+	}
+	if len(resp.EventIDs) != 3 {
+		t.Fatalf("expected 3 event IDs, got %d", len(resp.EventIDs))
+	}
+
+	// Verify all event IDs are distinct
+	idSet := make(map[string]bool)
+	for _, id := range resp.EventIDs {
+		if id == "" {
+			t.Errorf("empty event ID generated")
+		}
+		if idSet[id] {
+			t.Errorf("duplicate event ID generated: %s", id)
+		}
+		idSet[id] = true
+	}
+
+	// Verify buffer received 3 raw events with exact payloads preserved
+	if len(mockBuf.published) != 3 {
+		t.Fatalf("expected 3 events published to buffer, got %d", len(mockBuf.published))
+	}
+	if mockBuf.published[0].Payload != "Aug 28 18:30:12 firewall01 DENY TCP SRC=10.0.0.1 DST=8.8.8.8" {
+		t.Errorf("event 0 payload mismatch: %s", mockBuf.published[0].Payload)
+	}
+	if mockBuf.published[1].Payload != `{"action":"block","ip":"1.2.3.4"}` {
+		t.Errorf("event 1 payload mismatch: %s", mockBuf.published[1].Payload)
+	}
+	if mockBuf.published[2].Payload != "2026-08-28,router-01,drop,10.0.0.5,10.0.0.6" {
+		t.Errorf("event 2 payload mismatch: %s", mockBuf.published[2].Payload)
+	}
+}
+
+func TestHandler_BatchIngest_ValidationErrors(t *testing.T) {
+	service := NewService(nil, "")
+	handler := NewHandler(service)
+
+	tests := []struct {
+		name       string
+		body       string
+		wantStatus int
+	}{
+		{
+			name:       "empty batch array",
+			body:       `[]`,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "malformed JSON",
+			body:       `[{not-valid-json`,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "batch with empty payload in one item",
+			body:       `[{"format":"syslog","source":"fw","payload":"valid"},{"format":"syslog","source":"fw","payload":""}]`,
+			wantStatus: http.StatusBadRequest,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/ingest/batch", bytes.NewBufferString(tc.body))
+			handler.HandleIngestBatch(rec, req)
+
+			if rec.Code != tc.wantStatus {
+				t.Errorf("expected status %d, got %d (body: %s)", tc.wantStatus, rec.Code, rec.Body.String())
+			}
+		})
 	}
 }

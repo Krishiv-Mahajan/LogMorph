@@ -54,6 +54,10 @@ func (b *inMemoryBuffer) Ack(ctx context.Context, stream, group string, ids ...s
 	return nil
 }
 
+func (b *inMemoryBuffer) ClaimPending(ctx context.Context, stream, group, consumer string, minIdleTime time.Duration, count int64) ([]buffer.RawMessage, error) {
+	return nil, nil
+}
+
 func (b *inMemoryBuffer) Ping(ctx context.Context) error {
 	return nil
 }
@@ -86,6 +90,7 @@ func TestFullTargetArchitecture_E2E(t *testing.T) {
 
 	w := worker.NewWorker(
 		rawBuf,
+		buffer.NewMemoryIdempotencyStore(),
 		rawStore,
 		detector,
 		driftDetector,

@@ -1,0 +1,29 @@
+# ---- Build Stage ----
+FROM golang:1.26-alpine AS builder
+
+WORKDIR /app
+
+# Download dependencies first so this layer is cached unless go.mod/go.sum change.
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy the full source tree and build the ingestion binary.
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -trimpath -ldflags="-s -w" \
+    -o /app/ingestion ./cmd/ingestion
+
+# ---- Runtime Stage ----
+FROM alpine:3
+
+# ca-certificates  — TLS roots for outbound HTTPS calls
+# tzdata           — timezone data
+# wget             — used by the Docker healthcheck (GET /health)
+RUN apk add --no-cache ca-certificates tzdata wget
+
+WORKDIR /app
+COPY --from=builder /app/ingestion ./ingestion
+
+EXPOSE 8080
+
+ENTRYPOINT ["/app/ingestion"]

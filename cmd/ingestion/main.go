@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -30,10 +31,13 @@ func main() {
 		rawStream = buffer.DefaultRawStreamName
 	}
 
+	// RAW_EVENT_STREAM_MAXLEN caps the Redis stream length approximately (0 = unlimited).
+	maxLen, _ := strconv.ParseInt(os.Getenv("RAW_EVENT_STREAM_MAXLEN"), 10, 64)
+
 	log.Println("[Ingestion] Initializing ULPF Ingestion Service...")
 
 	// 1. Initialize Redis Raw Stream Buffer
-	rawBuffer, err := buffer.NewRedisRawBuffer(redisAddr, redisPassword, 0)
+	rawBuffer, err := buffer.NewRedisRawBuffer(redisAddr, redisPassword, 0, maxLen)
 	if err != nil {
 		log.Fatalf("[Ingestion] Failed to connect to Redis buffer: %v", err)
 	}
