@@ -187,4 +187,3 @@ func TestDriftStatusEnum_DeclaredConstants(t *testing.T) {
 		t.Errorf("expected DriftStatusUnknown to be 'unknown', got %q", models.DriftStatusUnknown)
 	}
 }
-

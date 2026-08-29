@@ -265,4 +265,3 @@ func TestSyslogParser_RFC5424PriorityPrefix(t *testing.T) {
 		t.Errorf("expected dst_port 443, got %v", event.Network.DstPort)
 	}
 }
-

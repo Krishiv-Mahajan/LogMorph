@@ -295,4 +295,3 @@ func TestCSVParser_OptionalFields(t *testing.T) {
 		}
 	})
 }
-

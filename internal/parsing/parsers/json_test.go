@@ -339,4 +339,3 @@ func TestJSONParser_TimestampFallback(t *testing.T) {
 		t.Errorf("expected valid RFC3339 timestamp fallback, got %q: %v", event.Timestamp, err)
 	}
 }
-
