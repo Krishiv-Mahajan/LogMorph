@@ -14,6 +14,7 @@ import (
 	"github.com/Krishiv-Mahajan/LogMorph/internal/normalization"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/parsing"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/parsing/parsers"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/status"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/raw"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/validation"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/worker"
@@ -79,6 +80,12 @@ func main() {
 	// WORKER_CONCURRENCY is the max number of events processed in parallel (default 4).
 	concurrency, _ := strconv.ParseInt(os.Getenv("WORKER_CONCURRENCY"), 10, 64)
 
+	// EVENT_STATUS_TTL_S sets the TTL for event status records in Redis (default 3600 s / 1 h).
+	statusTTLSecs, _ := strconv.ParseInt(os.Getenv("EVENT_STATUS_TTL_S"), 10, 64)
+	if statusTTLSecs <= 0 {
+		statusTTLSecs = status.DefaultStatusTTLSecs
+	}
+
 	log.Printf("[Worker] Initializing ULPF Processing Worker (Redis: %s, Stream: %s, Group: %s)...",
 		redisAddr, rawStream, groupName)
 
@@ -105,7 +112,11 @@ func main() {
 		}
 	}
 
-	// 2. Immutable Raw Event Store (MinIO with Memory fallback)
+	// 2. Event Status Store (reuses the same Redis connection as the raw buffer)
+	statusStore := status.NewRedisStatusStore(rawBuffer, time.Duration(statusTTLSecs)*time.Second)
+	log.Printf("[Worker] Event status store initialized (TTL: %ds)", statusTTLSecs)
+
+	// 3. Immutable Raw Event Store (MinIO with Memory fallback)
 	ctxMinio, cancelMinio := context.WithTimeout(context.Background(), 5*time.Second)
 	var rawStore raw.RawEventStore
 	minioStore, err := raw.NewMinIORawStore(ctxMinio, raw.MinIOConfig{
@@ -126,27 +137,27 @@ func main() {
 	}
 	defer rawStore.Close()
 
-	// 3. Detection & Drift
+	// 4. Detection & Drift
 	detector := detection.NewDetector()
 	driftDetector := detection.NewDriftDetector()
 
-	// 4. Parser Engine & Registry
+	// 5. Parser Engine & Registry
 	registry := parsing.NewRegistry()
 	registry.Register(parsers.NewSyslogParser())
 	registry.Register(parsers.NewJSONParser())
 	registry.Register(parsers.NewCSVParser())
 	parserEngine := parsing.NewEngine(registry)
 
-	// 5. Normalizer
+	// 6. Normalizer
 	normalizer := normalization.NewNormalizer()
 
-	// 6. JSON Schema Validator
+	// 7. JSON Schema Validator
 	validator, err := validation.NewValidator("")
 	if err != nil {
 		log.Fatalf("[Worker] Failed to initialize JSON Schema validator: %v", err)
 	}
 
-	// 7. Worker Instance
+	// 8. Worker Instance
 	w := worker.NewWorker(
 		rawBuffer,
 		idempotencyStore,
@@ -165,6 +176,7 @@ func main() {
 			DoneTTLSeconds: doneTTL,
 			BatchSize:      batchSize,
 			Concurrency:    concurrency,
+			StatusStore:    statusStore,
 		},
 	)
 

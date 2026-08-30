@@ -12,6 +12,7 @@ import (
 
 	"github.com/Krishiv-Mahajan/LogMorph/internal/buffer"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/ingestion"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/status"
 )
 
 func main() {
@@ -34,6 +35,12 @@ func main() {
 	// RAW_EVENT_STREAM_MAXLEN caps the Redis stream length approximately (0 = unlimited).
 	maxLen, _ := strconv.ParseInt(os.Getenv("RAW_EVENT_STREAM_MAXLEN"), 10, 64)
 
+	// EVENT_STATUS_TTL_S sets the TTL for event status records in Redis (default 3600 s / 1 h).
+	statusTTLSecs, _ := strconv.ParseInt(os.Getenv("EVENT_STATUS_TTL_S"), 10, 64)
+	if statusTTLSecs <= 0 {
+		statusTTLSecs = status.DefaultStatusTTLSecs
+	}
+
 	log.Println("[Ingestion] Initializing ULPF Ingestion Service...")
 
 	// 1. Initialize Redis Raw Stream Buffer
@@ -51,9 +58,13 @@ func main() {
 	}
 	cancelPing()
 
-	// 2. Ingestion Service & HTTP Handler
-	service := ingestion.NewService(rawBuffer, rawStream)
-	handler := ingestion.NewHandler(service)
+	// 2. Event Status Store (reuses the same Redis connection as the raw buffer)
+	statusStore := status.NewRedisStatusStore(rawBuffer, time.Duration(statusTTLSecs)*time.Second)
+	log.Printf("[Ingestion] Event status store initialized (TTL: %ds)", statusTTLSecs)
+
+	// 3. Ingestion Service & HTTP Handler
+	service := ingestion.NewServiceWithStatus(rawBuffer, rawStream, statusStore)
+	handler := ingestion.NewHandlerWithStatus(service, statusStore)
 
 	mux := http.NewServeMux()
 	handler.RegisterRoutes(mux)
@@ -65,12 +76,12 @@ func main() {
 		WriteTimeout: 10 * time.Second,
 	}
 
-	// 3. Graceful Shutdown
+	// 4. Graceful Shutdown
 	stopChan := make(chan os.Signal, 1)
 	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("[Ingestion] HTTP API listening on :%s (endpoint: POST /ingest)", port)
+		log.Printf("[Ingestion] HTTP API listening on :%s (POST /ingest, GET /events/{id}/status)", port)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("[Ingestion] Server error: %v", err)
 		}

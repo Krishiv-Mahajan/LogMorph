@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/Krishiv-Mahajan/LogMorph/internal/models"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/normalization"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/parsing"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/status"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/raw"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/validation"
 )
@@ -35,6 +37,7 @@ type Worker struct {
 	parserEngine  parsing.Engine
 	normalizer    *normalization.Normalizer
 	validator     validation.Validator
+	statusStore   status.Store // optional; nil disables status tracking
 
 	streamName   string
 	groupName    string
@@ -87,6 +90,10 @@ type Config struct {
 	// Concurrency is the maximum number of messages processed in parallel.
 	// Default: 4.
 	Concurrency int64
+
+	// StatusStore is an optional event status store used to publish per-stage
+	// progress for frontend polling. nil disables status tracking.
+	StatusStore status.Store
 }
 
 const (
@@ -142,6 +149,7 @@ func NewWorker(
 		parserEngine:  parserEngine,
 		normalizer:    normalizer,
 		validator:     validator,
+		statusStore:   cfg.StatusStore,
 		streamName:    cfg.StreamName,
 		groupName:     cfg.GroupName,
 		consumerName:  cfg.ConsumerName,
@@ -158,42 +166,180 @@ func NewWorker(
 	return w
 }
 
+// updateStage is a nil-safe helper that updates a single pipeline stage.
+// Errors are logged but do not interrupt the pipeline.
+func (w *Worker) updateStage(ctx context.Context, eventID string, stage status.StageResult) {
+	if w.statusStore == nil {
+		return
+	}
+	if err := w.statusStore.UpdateStage(ctx, eventID, stage); err != nil {
+		log.Printf("[Worker] Warning: status UpdateStage %s/%s failed: %v", eventID, stage.ID, err)
+	}
+}
+
+// updateOverall is a nil-safe helper that patches top-level EventStatus fields.
+// Errors are logged but do not interrupt the pipeline.
+func (w *Worker) updateOverall(ctx context.Context, eventID string, u status.OverallUpdate) {
+	if w.statusStore == nil {
+		return
+	}
+	if err := w.statusStore.UpdateOverall(ctx, eventID, u); err != nil {
+		log.Printf("[Worker] Warning: status UpdateOverall %s failed: %v", eventID, err)
+	}
+}
+
 // ProcessSingleEvent executes the immutable raw store copy and full processing
 // pipeline for one event. It does NOT perform idempotency checks — those are
 // handled by the caller (processSingleMessageIdempotent).
 func (w *Worker) ProcessSingleEvent(ctx context.Context, rawEvent models.RawEvent) (*PipelineResult, error) {
+	eventID := rawEvent.EventID
+
 	// 1. Immutable Raw Event Store (side-branch; path: raw-events/{event_id}.json)
 	if w.rawStore != nil {
 		if err := w.rawStore.Put(ctx, &rawEvent); err != nil {
-			log.Printf("[Worker] Warning: failed to persist raw event %s to MinIO: %v", rawEvent.EventID, err)
+			log.Printf("[Worker] Warning: failed to persist raw event %s to MinIO: %v", eventID, err)
 		}
 	}
 
-	// 2. Format / Source Detection
+	// ── 2. Format / Source Detection ─────────────────────────────────────────
+	w.updateStage(ctx, eventID, status.StageResult{
+		ID:    status.StageDetection,
+		Label: "Detection",
+		State: status.StateProcessing,
+	})
+
 	detectionRes := w.detector.Detect(rawEvent.Payload, rawEvent.Format)
 
-	// 3. Drift Analysis
+	if detectionRes.Format == detection.FormatUnknown {
+		w.updateStage(ctx, eventID, status.StageResult{
+			ID:     status.StageDetection,
+			Label:  "Detection",
+			State:  status.StateWarning,
+			Detail: fmt.Sprintf("UNKNOWN • %.0f%%", detectionRes.Confidence*100),
+		})
+	} else {
+		w.updateStage(ctx, eventID, status.StageResult{
+			ID:     status.StageDetection,
+			Label:  "Detection",
+			State:  status.StateSuccess,
+			Detail: fmt.Sprintf("%s • %.0f%%", strings.ToUpper(detectionRes.Format), detectionRes.Confidence*100),
+		})
+	}
+	w.updateOverall(ctx, eventID, status.OverallUpdate{
+		FormatName:      detectionRes.Format,
+		ConfidenceScore: detectionRes.Confidence,
+	})
+
+	// ── 3. Drift Analysis ─────────────────────────────────────────────────────
+	w.updateStage(ctx, eventID, status.StageResult{
+		ID:    status.StageDrift,
+		Label: "Drift",
+		State: status.StateProcessing,
+	})
+
 	driftRes, err := w.driftDetector.Analyze(ctx, rawEvent, detectionRes)
 	if err != nil {
-		log.Printf("[Worker] Drift analysis error for event %s: %v", rawEvent.EventID, err)
-	}
-	if driftRes.Status == models.DriftStatusUnknown || driftRes.Status == models.DriftStatusMajorDrift {
-		log.Printf("[Worker] Drift alert: event %s classified as %s (%s)", rawEvent.EventID, driftRes.Status, driftRes.Message)
+		log.Printf("[Worker] Drift analysis error for event %s: %v", eventID, err)
 	}
 
-	// 4. Parser Engine
+	if driftRes.Status == models.DriftStatusUnknown || driftRes.Status == models.DriftStatusMajorDrift {
+		log.Printf("[Worker] Drift alert: event %s classified as %s (%s)", eventID, driftRes.Status, driftRes.Message)
+		w.updateStage(ctx, eventID, status.StageResult{
+			ID:     status.StageDrift,
+			Label:  "Drift",
+			State:  status.StateWarning,
+			Detail: "DRIFT DETECTED",
+		})
+		w.updateOverall(ctx, eventID, status.OverallUpdate{
+			Status:        status.StatusDrift,
+			DriftDetected: status.BoolPtr(true),
+			ErrorMessage:  driftRes.Message,
+		})
+	} else {
+		w.updateStage(ctx, eventID, status.StageResult{
+			ID:     status.StageDrift,
+			Label:  "Drift",
+			State:  status.StateSuccess,
+			Detail: "STABLE",
+		})
+	}
+	// Existing behavior: log drift and continue to parsing regardless.
+
+	// ── 4. Parser Engine ──────────────────────────────────────────────────────
+	w.updateStage(ctx, eventID, status.StageResult{
+		ID:    status.StageParsing,
+		Label: "Parsing",
+		State: status.StateProcessing,
+	})
+
 	parsedEvent, err := w.parserEngine.Parse(ctx, rawEvent, detectionRes)
 	if err != nil {
+		errMsg := err.Error()
+		w.updateStage(ctx, eventID, status.StageResult{
+			ID:    status.StageParsing,
+			Label: "Parsing",
+			State: status.StateError,
+			Error: errMsg,
+		})
+		w.updateOverall(ctx, eventID, status.OverallUpdate{
+			Status:       status.StatusError,
+			ErrorMessage: errMsg,
+		})
 		return nil, fmt.Errorf("parsing failed: %w", err)
 	}
 
-	// 5. Normalization
+	w.updateStage(ctx, eventID, status.StageResult{
+		ID:     status.StageParsing,
+		Label:  "Parsing",
+		State:  status.StateSuccess,
+		Detail: strings.ToUpper(detectionRes.Format),
+	})
+	w.updateOverall(ctx, eventID, status.OverallUpdate{
+		ParserName: detectionRes.Format,
+	})
+
+	// ── 5. Normalization ──────────────────────────────────────────────────────
+	w.updateStage(ctx, eventID, status.StageResult{
+		ID:    status.StageNormalization,
+		Label: "Normalization",
+		State: status.StateProcessing,
+	})
+
 	universalEvent, err := w.normalizer.Normalize(rawEvent, parsedEvent, detectionRes)
 	if err != nil {
+		errMsg := err.Error()
+		w.updateStage(ctx, eventID, status.StageResult{
+			ID:    status.StageNormalization,
+			Label: "Normalization",
+			State: status.StateError,
+			Error: errMsg,
+		})
+		w.updateOverall(ctx, eventID, status.OverallUpdate{
+			Status:       status.StatusError,
+			ErrorMessage: errMsg,
+		})
 		return nil, fmt.Errorf("normalization failed: %w", err)
 	}
 
-	// 6. JSON Schema Validation
+	w.updateStage(ctx, eventID, status.StageResult{
+		ID:     status.StageNormalization,
+		Label:  "Normalization",
+		State:  status.StateSuccess,
+		Detail: "Standardized",
+	})
+	// Capture source and action from the normalized event for the status overview.
+	w.updateOverall(ctx, eventID, status.OverallUpdate{
+		Source: universalEvent.Source.Type,
+		Action: universalEvent.Event.Action,
+	})
+
+	// ── 6. JSON Schema Validation ─────────────────────────────────────────────
+	w.updateStage(ctx, eventID, status.StageResult{
+		ID:    status.StageValidation,
+		Label: "Validation",
+		State: status.StateProcessing,
+	})
+
 	valResult := w.validator.Validate(universalEvent)
 
 	res := &PipelineResult{
@@ -205,6 +351,17 @@ func (w *Worker) ProcessSingleEvent(ctx context.Context, rawEvent models.RawEven
 	}
 
 	if valResult.Valid {
+		w.updateStage(ctx, eventID, status.StageResult{
+			ID:     status.StageValidation,
+			Label:  "Validation",
+			State:  status.StateSuccess,
+			Detail: "VALID",
+		})
+		w.updateOverall(ctx, eventID, status.OverallUpdate{
+			Status:         status.StatusParsed,
+			UniversalEvent: universalEvent,
+		})
+
 		netDetails := "n/a"
 		if universalEvent.Network != nil {
 			srcPort := 0
@@ -228,6 +385,27 @@ func (w *Worker) ProcessSingleEvent(ctx context.Context, rawEvent models.RawEven
 			universalEvent.Timestamp,
 		)
 	} else {
+		// Build a concise error summary from validation errors.
+		var errParts []string
+		for _, ve := range valResult.Errors {
+			errParts = append(errParts, fmt.Sprintf("%s: %s", ve.Field, ve.Message))
+		}
+		errSummary := strings.Join(errParts, "; ")
+		if errSummary == "" {
+			errSummary = "validation failed"
+		}
+
+		w.updateStage(ctx, eventID, status.StageResult{
+			ID:     status.StageValidation,
+			Label:  "Validation",
+			State:  status.StateError,
+			Detail: "INVALID",
+			Error:  errSummary,
+		})
+		w.updateOverall(ctx, eventID, status.OverallUpdate{
+			Status:       status.StatusError,
+			ErrorMessage: errSummary,
+		})
 		log.Printf("[Worker] Validation failed for event %s: %v", universalEvent.EventID, valResult.Errors)
 	}
 

@@ -208,6 +208,14 @@ func (r *RedisRawBuffer) Close() error {
 	return r.client.Close()
 }
 
+// Client returns the underlying go-redis client.
+// This allows other packages (e.g. status) to reuse the same connection
+// without opening a second one, following the same pattern as
+// NewRedisIdempotencyStore.
+func (r *RedisRawBuffer) Client() *goredis.Client {
+	return r.client
+}
+
 // parseXMessage extracts a RawMessage from a raw Redis XMessage.
 // Returns (msg, true) on success; (zero, false) if the message is malformed.
 func parseXMessage(msg goredis.XMessage) (RawMessage, bool) {

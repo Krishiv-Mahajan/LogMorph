@@ -3,9 +3,12 @@ package ingestion
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
+
+	"github.com/Krishiv-Mahajan/LogMorph/internal/status"
 )
 
 // IngestResponse is returned on successful event acceptance into the raw buffer.
@@ -23,13 +26,22 @@ type ErrorResponse struct {
 
 // Handler handles HTTP requests for log ingestion.
 type Handler struct {
-	service Service
+	service     Service
+	statusStore status.Store // optional; nil disables GET /events/{id}/status
 }
 
-// NewHandler creates a new Ingestion HTTP handler.
+// NewHandler creates a new Ingestion HTTP handler without status tracking.
+// Existing callers continue to work unchanged.
 func NewHandler(service Service) *Handler {
+	return NewHandlerWithStatus(service, nil)
+}
+
+// NewHandlerWithStatus creates a Handler that also exposes the event status
+// endpoint. When statusStore is nil the status route returns 501 Not Implemented.
+func NewHandlerWithStatus(service Service, statusStore status.Store) *Handler {
 	return &Handler{
-		service: service,
+		service:     service,
+		statusStore: statusStore,
 	}
 }
 
@@ -38,6 +50,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /ingest/batch", h.HandleIngestBatch)
 	mux.HandleFunc("POST /ingest", h.HandleIngest)
 	mux.HandleFunc("GET /health", h.HandleHealth)
+	mux.HandleFunc("GET /events/{event_id}/status", h.HandleGetEventStatus)
 }
 
 // HandleHealth handles health check requests.
@@ -136,8 +149,58 @@ func (h *Handler) HandleIngestBatch(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (h *Handler) writeJSONError(w http.ResponseWriter, status int, resp ErrorResponse) {
+// HandleGetEventStatus returns the current processing status for an event.
+//
+//	GET /events/{event_id}/status
+//
+// Responses:
+//   - 200 OK        — EventStatus JSON
+//   - 404 Not Found — event_id does not exist in the status store
+//   - 501            — status store not configured
+func (h *Handler) HandleGetEventStatus(w http.ResponseWriter, r *http.Request) {
+	if h.statusStore == nil {
+		h.writeJSONError(w, http.StatusNotImplemented, ErrorResponse{
+			Status:  "not_implemented",
+			Message: "status tracking is not enabled",
+		})
+		return
+	}
+
+	eventID := r.PathValue("event_id")
+	if eventID == "" {
+		h.writeJSONError(w, http.StatusBadRequest, ErrorResponse{
+			Status:  "bad_request",
+			Message: "event_id is required",
+		})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	s, err := h.statusStore.Get(ctx, eventID)
+	if err != nil {
+		if errors.Is(err, status.ErrNotFound) {
+			h.writeJSONError(w, http.StatusNotFound, ErrorResponse{
+				Status:  "not_found",
+				Message: "event status not found",
+			})
+			return
+		}
+		h.writeJSONError(w, http.StatusInternalServerError, ErrorResponse{
+			Status:  "internal_error",
+			Message: "failed to retrieve event status",
+		})
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(s)
+}
+
+func (h *Handler) writeJSONError(w http.ResponseWriter, statusCode int, resp ErrorResponse) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
 	_ = json.NewEncoder(w).Encode(resp)
 }
