@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -197,7 +198,17 @@ func (w *Worker) ProcessSingleEvent(ctx context.Context, rawEvent models.RawEven
 	detectionRes := w.detector.Detect(rawEvent.Payload, rawEvent.Format)
 	evtState.FormatName = detectionRes.Format
 	evtState.ConfidenceScore = detectionRes.Confidence
-	evtState.Stages["detection"] = state.StageResult{ID: "detection", Label: "Detection", State: state.StageSuccess, Detail: fmt.Sprintf("%s • %.0f%%", detectionRes.Format, detectionRes.Confidence*100)}
+	var detectionState state.StageState
+	var detectionDetail string
+	if detectionRes.Format == "unknown" {
+		detectionState = state.StageWarning
+		detectionDetail = "UNKNOWN FORMAT"
+	} else {
+		detectionState = state.StageSuccess
+		detectionDetail = fmt.Sprintf("%s DETECTED", strings.ToUpper(detectionRes.Format))
+	}
+
+	evtState.Stages["detection"] = state.StageResult{ID: "detection", Label: "Detection", State: detectionState, Detail: detectionDetail}
 	evtState.Stages["drift"] = state.StageResult{ID: "drift", Label: "Drift", State: state.StageProcessing}
 	if w.stateStore != nil {
 		_ = w.stateStore.UpdateEventState(ctx, evtState)

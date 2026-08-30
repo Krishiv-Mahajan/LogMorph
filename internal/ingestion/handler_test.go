@@ -49,7 +49,7 @@ func (m *mockRawBuffer) Close() error {
 func TestHandler_IngestAndHealth(t *testing.T) {
 	mockBuf := &mockRawBuffer{}
 	service := NewService(mockBuf, "raw_events")
-	handler := NewHandler(service, nil)
+	handler := NewHandler(service, nil, nil)
 
 	// Test GET /health
 	recHealth := httptest.NewRecorder()
@@ -87,7 +87,7 @@ func TestHandler_IngestAndHealth(t *testing.T) {
 
 func TestHandler_EmptyPayload(t *testing.T) {
 	service := NewService(nil, "")
-	handler := NewHandler(service, nil)
+	handler := NewHandler(service, nil, nil)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/ingest", bytes.NewBufferString(`{"payload":""}`))
@@ -101,7 +101,7 @@ func TestHandler_EmptyPayload(t *testing.T) {
 func TestHandler_BatchIngest_Success(t *testing.T) {
 	mockBuf := &mockRawBuffer{}
 	service := NewService(mockBuf, "raw_events")
-	handler := NewHandler(service, nil)
+	handler := NewHandler(service, nil, nil)
 
 	batchPayload := `[
 		{"format":"syslog","source":"firewall-01","payload":"Aug 28 18:30:12 firewall01 DENY TCP SRC=10.0.0.1 DST=8.8.8.8"},
@@ -161,7 +161,7 @@ func TestHandler_BatchIngest_Success(t *testing.T) {
 
 func TestHandler_BatchIngest_ValidationErrors(t *testing.T) {
 	service := NewService(nil, "")
-	handler := NewHandler(service, nil)
+	handler := NewHandler(service, nil, nil)
 
 	tests := []struct {
 		name       string
