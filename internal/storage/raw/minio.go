@@ -108,6 +108,11 @@ func (m *MinIORawStore) Get(ctx context.Context, eventID string) (*models.RawEve
 	return &event, nil
 }
 
+func (m *MinIORawStore) Ping(ctx context.Context) error {
+	_, err := m.client.BucketExists(ctx, m.bucket)
+	return err
+}
+
 func (m *MinIORawStore) Close() error {
 	return nil
 }

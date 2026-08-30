@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	"github.com/Krishiv-Mahajan/LogMorph/internal/state"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/raw"
 )
 
 // IngestResponse is returned on successful event acceptance into the raw buffer.
@@ -23,13 +26,17 @@ type ErrorResponse struct {
 
 // Handler handles HTTP requests for log ingestion.
 type Handler struct {
-	service Service
+	service    Service
+	stateStore state.Store
+	rawStore   raw.RawEventStore
 }
 
-// NewHandler creates a new Ingestion HTTP handler.
-func NewHandler(service Service) *Handler {
+// NewHandler creates a new Ingestion API HTTP handler.
+func NewHandler(service Service, stateStore state.Store, rawStore raw.RawEventStore) *Handler {
 	return &Handler{
-		service: service,
+		service:    service,
+		stateStore: stateStore,
+		rawStore:   rawStore,
 	}
 }
 
@@ -38,13 +45,120 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /ingest/batch", h.HandleIngestBatch)
 	mux.HandleFunc("POST /ingest", h.HandleIngest)
 	mux.HandleFunc("GET /health", h.HandleHealth)
+	
+	// Dashboard API
+	mux.HandleFunc("GET /api/status", h.HandleStatus)
+	mux.HandleFunc("GET /api/metrics", h.HandleMetrics)
+	mux.HandleFunc("GET /api/events/recent", h.HandleRecentEvents)
+	mux.HandleFunc("GET /api/events/{id}", h.HandleEventState)
 }
 
 // HandleHealth handles health check requests.
 func (h *Handler) HandleHealth(w http.ResponseWriter, r *http.Request) {
+	health := map[string]string{
+		"backend": "ONLINE",
+		"redis":   "ONLINE",
+		"minio":   "UNKNOWN",
+		"overall": "ONLINE",
+	}
+	
+	if h.stateStore != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := h.stateStore.Ping(ctx); err != nil {
+			health["redis"] = "OFFLINE"
+			health["overall"] = "DEGRADED"
+		}
+	}
+
+	if h.rawStore != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := h.rawStore.Ping(ctx); err != nil {
+			health["minio"] = "OFFLINE"
+			health["overall"] = "DEGRADED"
+		} else {
+			health["minio"] = "ONLINE"
+		}
+	}
+	
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	_ = json.NewEncoder(w).Encode(health)
+}
+
+func (h *Handler) HandleStatus(w http.ResponseWriter, r *http.Request) {
+	// Simple worker status since we don't have direct access to redis stream XINFO here easily.
+	// In a full implementation, we'd query Redis.
+	status := map[string]any{
+		"worker_count": 1, // hardcoded for MVP unless we add XINFO GROUPS to stateStore
+		"status": "ONLINE",
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(status)
+}
+
+func (h *Handler) HandleMetrics(w http.ResponseWriter, r *http.Request) {
+	if h.stateStore == nil {
+		h.writeJSONError(w, http.StatusServiceUnavailable, ErrorResponse{Status: "error", Message: "State store uninitialized"})
+		return
+	}
+	
+	metrics, err := h.stateStore.GetMetrics(r.Context())
+	if err != nil {
+		h.writeJSONError(w, http.StatusInternalServerError, ErrorResponse{Status: "error", Message: err.Error()})
+		return
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(metrics)
+}
+
+func (h *Handler) HandleRecentEvents(w http.ResponseWriter, r *http.Request) {
+	if h.stateStore == nil {
+		h.writeJSONError(w, http.StatusServiceUnavailable, ErrorResponse{Status: "error", Message: "State store uninitialized"})
+		return
+	}
+	
+	events, err := h.stateStore.GetRecentEvents(r.Context(), 50)
+	if err != nil {
+		h.writeJSONError(w, http.StatusInternalServerError, ErrorResponse{Status: "error", Message: err.Error()})
+		return
+	}
+	
+	if events == nil {
+		events = []state.EventState{}
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(events)
+}
+
+func (h *Handler) HandleEventState(w http.ResponseWriter, r *http.Request) {
+	if h.stateStore == nil {
+		h.writeJSONError(w, http.StatusServiceUnavailable, ErrorResponse{Status: "error", Message: "State store uninitialized"})
+		return
+	}
+	
+	id := r.PathValue("id")
+	if id == "" {
+		h.writeJSONError(w, http.StatusBadRequest, ErrorResponse{Status: "error", Message: "Missing event ID"})
+		return
+	}
+	
+	evtState, err := h.stateStore.GetEventState(r.Context(), id)
+	if err != nil {
+		h.writeJSONError(w, http.StatusNotFound, ErrorResponse{Status: "error", Message: "Event not found"})
+		return
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(evtState)
 }
 
 // HandleIngest accepts a single raw log payload and buffers it immediately into Redis.

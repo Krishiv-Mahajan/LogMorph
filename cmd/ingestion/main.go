@@ -12,6 +12,8 @@ import (
 
 	"github.com/Krishiv-Mahajan/LogMorph/internal/buffer"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/ingestion"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/state"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/raw"
 )
 
 func main() {
@@ -51,16 +53,69 @@ func main() {
 	}
 	cancelPing()
 
-	// 2. Ingestion Service & HTTP Handler
+	// 2. State Store for Dashboard API
+	stateStore, err := state.NewRedisStateStore(redisAddr, redisPassword, 0)
+	if err != nil {
+		log.Printf("[Ingestion] Warning: Failed to connect to state store: %v", err)
+	}
+
+	// 3. MinIO Client for Health Checks
+	minioEndpoint := os.Getenv("MINIO_ENDPOINT")
+	if minioEndpoint == "" {
+		minioEndpoint = "localhost:9000"
+	}
+	minioAccessKey := os.Getenv("MINIO_ACCESS_KEY")
+	if minioAccessKey == "" {
+		minioAccessKey = "minioadmin"
+	}
+	minioSecretKey := os.Getenv("MINIO_SECRET_KEY")
+	if minioSecretKey == "" {
+		minioSecretKey = "minioadmin"
+	}
+	minioBucket := os.Getenv("MINIO_BUCKET")
+	if minioBucket == "" {
+		minioBucket = "raw-events"
+	}
+
+	var rawStore raw.RawEventStore
+	minioStore, err := raw.NewMinIORawStore(context.Background(), raw.MinIOConfig{
+		Endpoint:        minioEndpoint,
+		AccessKeyID:     minioAccessKey,
+		SecretAccessKey: minioSecretKey,
+		UseSSL:          false,
+		BucketName:      minioBucket,
+	})
+	if err != nil {
+		log.Printf("[Ingestion] Warning: Failed to connect to MinIO: %v", err)
+		// Fallback to memory store if minio fails to connect
+		rawStore = raw.NewMemoryRawStore()
+	} else {
+		rawStore = minioStore
+	}
+
+	// 4. Ingestion Service & HTTP Handler
 	service := ingestion.NewService(rawBuffer, rawStream)
-	handler := ingestion.NewHandler(service)
+	handler := ingestion.NewHandler(service, stateStore, rawStore)
 
 	mux := http.NewServeMux()
 	handler.RegisterRoutes(mux)
+	
+	corsHandler := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			if r.Method == "OPTIONS" {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 
 	server := &http.Server{
 		Addr:         ":" + port,
-		Handler:      mux,
+		Handler:      corsHandler(mux),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}

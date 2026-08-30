@@ -149,7 +149,7 @@ func setupTestWorkerWithIdempotency(
 	w := NewWorker(
 		mockBuf,
 		idempotency,
-		rawStore,
+		rawStore, nil,
 		detection.NewDetector(),
 		detection.NewDriftDetector(),
 		buildParserEngine(),
@@ -236,7 +236,7 @@ func TestWorker_ClaimsPendingOnRecovery(t *testing.T) {
 	w := NewWorker(
 		mockBuf,
 		buffer.NewMemoryIdempotencyStore(),
-		rawStore,
+		rawStore, nil,
 		detection.NewDetector(),
 		detection.NewDriftDetector(),
 		buildParserEngine(),
@@ -388,7 +388,7 @@ func TestIdempotency_FailureReleasesLockAndNoACK(t *testing.T) {
 		Event: models.RawEvent{
 			EventID:    "evt_fail",
 			ReceivedAt: time.Now().UTC().Format(time.RFC3339),
-			Format:     "unknown_format", // no parser registered → engine returns error
+			Format:     "syslog", // parser will fail
 			Source:     "test",
 			Payload:    "some raw log data",
 		},
@@ -411,7 +411,7 @@ func TestIdempotency_FailureReleasesLockAndNoACK(t *testing.T) {
 	w := NewWorker(
 		mockBuf,
 		idempotency,
-		rawStore,
+		rawStore, nil,
 		detection.NewDetector(),
 		detection.NewDriftDetector(),
 		emptyEngine,
@@ -546,7 +546,7 @@ func TestWorker_ConcurrentBatchProcessing(t *testing.T) {
 	w := NewWorker(
 		mockBuf,
 		idempotency,
-		rawStore,
+		rawStore, nil,
 		detection.NewDetector(),
 		detection.NewDriftDetector(),
 		buildParserEngine(),
@@ -595,9 +595,9 @@ func TestWorker_PartialFailureInBatch(t *testing.T) {
 			Event: models.RawEvent{
 				EventID:    "evt_bad_fail",
 				ReceivedAt: time.Now().UTC().Format(time.RFC3339),
-				Format:     "unknown_no_parser",
+				Format:     "json",
 				Source:     "bad-source",
-				Payload:    "some bad unparseable data",
+				Payload:    "invalid json data",
 			},
 		},
 		syslogMsg("msg-valid-2", "evt_valid_2"),
@@ -616,7 +616,7 @@ func TestWorker_PartialFailureInBatch(t *testing.T) {
 	w := NewWorker(
 		mockBuf,
 		idempotency,
-		rawStore,
+		rawStore, nil,
 		detection.NewDetector(),
 		detection.NewDriftDetector(),
 		buildParserEngine(),

@@ -24,12 +24,7 @@ func (p *JSONParser) Format() string {
 
 type jsonLogSchema struct {
 	Timestamp string `json:"timestamp"`
-	Source    *struct {
-		Identifier string `json:"identifier"`
-		Vendor     string `json:"vendor"`
-		Product    string `json:"product"`
-		Type       string `json:"type"`
-	} `json:"source"`
+	Source    interface{} `json:"source"`
 	Firewall *struct {
 		Action   string `json:"action"`
 		Protocol string `json:"protocol"`
@@ -131,17 +126,22 @@ func (p *JSONParser) Parse(ctx context.Context, raw models.RawEvent) (*models.Pa
 	}
 
 	if data.Source != nil {
-		if data.Source.Type != "" {
-			srcType = data.Source.Type
-		}
-		if data.Source.Vendor != "" {
-			srcVendor = data.Source.Vendor
-		}
-		if data.Source.Product != "" {
-			srcProduct = data.Source.Product
-		}
-		if data.Source.Identifier != "" {
-			srcIdentifier = data.Source.Identifier
+		switch src := data.Source.(type) {
+		case string:
+			srcIdentifier = src
+		case map[string]interface{}:
+			if t, ok := src["type"].(string); ok && t != "" {
+				srcType = t
+			}
+			if v, ok := src["vendor"].(string); ok && v != "" {
+				srcVendor = v
+			}
+			if p, ok := src["product"].(string); ok && p != "" {
+				srcProduct = p
+			}
+			if id, ok := src["identifier"].(string); ok && id != "" {
+				srcIdentifier = id
+			}
 		}
 	}
 

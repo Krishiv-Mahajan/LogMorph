@@ -14,6 +14,7 @@ import (
 	"github.com/Krishiv-Mahajan/LogMorph/internal/normalization"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/parsing"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/parsing/parsers"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/state"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/raw"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/validation"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/worker"
@@ -145,12 +146,19 @@ func main() {
 	if err != nil {
 		log.Fatalf("[Worker] Failed to initialize JSON Schema validator: %v", err)
 	}
+	
+	// 7. State Store
+	stateStore, err := state.NewRedisStateStore(redisAddr, redisPassword, 0)
+	if err != nil {
+		log.Fatalf("[Worker] Failed to create Redis state store: %v", err)
+	}
 
-	// 7. Worker Instance
+	// 8. Worker Instance
 	w := worker.NewWorker(
 		rawBuffer,
 		idempotencyStore,
 		rawStore,
+		stateStore,
 		detector,
 		driftDetector,
 		parserEngine,

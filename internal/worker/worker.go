@@ -12,6 +12,7 @@ import (
 	"github.com/Krishiv-Mahajan/LogMorph/internal/models"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/normalization"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/parsing"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/state"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/raw"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/validation"
 )
@@ -30,6 +31,7 @@ type Worker struct {
 	buffer        buffer.RawBuffer
 	idempotency   buffer.IdempotencyStore
 	rawStore      raw.RawEventStore
+	stateStore    state.Store
 	detector      detection.Detector
 	driftDetector detection.DriftDetector
 	parserEngine  parsing.Engine
@@ -104,6 +106,7 @@ func NewWorker(
 	buf buffer.RawBuffer,
 	idempotency buffer.IdempotencyStore,
 	rawStore raw.RawEventStore,
+	stateStore state.Store,
 	detector detection.Detector,
 	driftDetector detection.DriftDetector,
 	parserEngine parsing.Engine,
@@ -137,6 +140,7 @@ func NewWorker(
 		buffer:        buf,
 		idempotency:   idempotency,
 		rawStore:      rawStore,
+		stateStore:    stateStore,
 		detector:      detector,
 		driftDetector: driftDetector,
 		parserEngine:  parserEngine,
@@ -162,6 +166,26 @@ func NewWorker(
 // pipeline for one event. It does NOT perform idempotency checks — those are
 // handled by the caller (processSingleMessageIdempotent).
 func (w *Worker) ProcessSingleEvent(ctx context.Context, rawEvent models.RawEvent) (*PipelineResult, error) {
+	// Initialize state
+	evtState := state.EventState{
+		EventID:    rawEvent.EventID,
+		Timestamp:  time.Now().Format(time.RFC3339),
+		FormatName: rawEvent.Format,
+		RawPayload: rawEvent.Payload,
+		Status:     "Processing",
+		Stages: map[string]state.StageResult{
+			"ingestion":     {ID: "ingestion", Label: "Ingestion", State: state.StageSuccess, Detail: "OK"},
+			"detection":     {ID: "detection", Label: "Detection", State: state.StageProcessing},
+			"drift":         {ID: "drift", Label: "Drift", State: state.StageIdle},
+			"parsing":       {ID: "parsing", Label: "Parsing", State: state.StageIdle},
+			"normalization": {ID: "normalization", Label: "Normalization", State: state.StageIdle},
+			"validation":    {ID: "validation", Label: "Validation", State: state.StageIdle},
+		},
+	}
+	if w.stateStore != nil {
+		_ = w.stateStore.UpdateEventState(ctx, evtState)
+	}
+
 	// 1. Immutable Raw Event Store (side-branch; path: raw-events/{event_id}.json)
 	if w.rawStore != nil {
 		if err := w.rawStore.Put(ctx, &rawEvent); err != nil {
@@ -171,6 +195,13 @@ func (w *Worker) ProcessSingleEvent(ctx context.Context, rawEvent models.RawEven
 
 	// 2. Format / Source Detection
 	detectionRes := w.detector.Detect(rawEvent.Payload, rawEvent.Format)
+	evtState.FormatName = detectionRes.Format
+	evtState.ConfidenceScore = detectionRes.Confidence
+	evtState.Stages["detection"] = state.StageResult{ID: "detection", Label: "Detection", State: state.StageSuccess, Detail: fmt.Sprintf("%s • %.0f%%", detectionRes.Format, detectionRes.Confidence*100)}
+	evtState.Stages["drift"] = state.StageResult{ID: "drift", Label: "Drift", State: state.StageProcessing}
+	if w.stateStore != nil {
+		_ = w.stateStore.UpdateEventState(ctx, evtState)
+	}
 
 	// 3. Drift Analysis
 	driftRes, err := w.driftDetector.Analyze(ctx, rawEvent, detectionRes)
@@ -179,18 +210,78 @@ func (w *Worker) ProcessSingleEvent(ctx context.Context, rawEvent models.RawEven
 	}
 	if driftRes.Status == models.DriftStatusUnknown || driftRes.Status == models.DriftStatusMajorDrift {
 		log.Printf("[Worker] Drift alert: event %s classified as %s (%s)", rawEvent.EventID, driftRes.Status, driftRes.Message)
+		
+		evtState.DriftDetected = true
+		evtState.Status = "Drift"
+		evtState.ErrorMessage = driftRes.Message
+		evtState.Stages["drift"] = state.StageResult{ID: "drift", Label: "Drift", State: state.StageWarning, Detail: "DRIFT DETECTED", Error: driftRes.Message}
+		evtState.Stages["parsing"] = state.StageResult{ID: "parsing", Label: "Parsing", State: state.StageIdle, Detail: "Skipped"}
+		if w.stateStore != nil {
+			_ = w.stateStore.UpdateEventState(ctx, evtState)
+			_ = w.stateStore.IncrementMetric(ctx, state.MetricDrift)
+			_ = w.stateStore.IncrementMetric(ctx, state.MetricProcessed)
+			_ = w.stateStore.PushRecentEvent(ctx, evtState)
+		}
+		
+		return &PipelineResult{
+			EventID: rawEvent.EventID,
+			Drift:   driftRes,
+		}, nil
+	}
+
+	evtState.Stages["drift"] = state.StageResult{ID: "drift", Label: "Drift", State: state.StageSuccess, Detail: "STABLE"}
+	evtState.Stages["parsing"] = state.StageResult{ID: "parsing", Label: "Parsing", State: state.StageProcessing}
+	if w.stateStore != nil {
+		_ = w.stateStore.UpdateEventState(ctx, evtState)
 	}
 
 	// 4. Parser Engine
 	parsedEvent, err := w.parserEngine.Parse(ctx, rawEvent, detectionRes)
 	if err != nil {
+		evtState.Status = "Error"
+		evtState.ErrorMessage = err.Error()
+		evtState.Stages["parsing"] = state.StageResult{ID: "parsing", Label: "Parsing", State: state.StageError, Detail: "Invalid syntax", Error: err.Error()}
+		if w.stateStore != nil {
+			_ = w.stateStore.UpdateEventState(ctx, evtState)
+			_ = w.stateStore.IncrementMetric(ctx, state.MetricErrors)
+			_ = w.stateStore.IncrementMetric(ctx, state.MetricProcessed)
+			_ = w.stateStore.PushRecentEvent(ctx, evtState)
+		}
 		return nil, fmt.Errorf("parsing failed: %w", err)
+	}
+
+	evtState.Stages["parsing"] = state.StageResult{ID: "parsing", Label: "Parsing", State: state.StageSuccess, Detail: "Parsed"}
+	evtState.Stages["normalization"] = state.StageResult{ID: "normalization", Label: "Normalization", State: state.StageProcessing}
+	if w.stateStore != nil {
+		_ = w.stateStore.UpdateEventState(ctx, evtState)
 	}
 
 	// 5. Normalization
 	universalEvent, err := w.normalizer.Normalize(rawEvent, parsedEvent, detectionRes)
 	if err != nil {
+		evtState.Status = "Error"
+		evtState.ErrorMessage = err.Error()
+		evtState.Stages["normalization"] = state.StageResult{ID: "normalization", Label: "Normalization", State: state.StageError, Detail: "Normalization failed", Error: err.Error()}
+		if w.stateStore != nil {
+			_ = w.stateStore.UpdateEventState(ctx, evtState)
+			_ = w.stateStore.IncrementMetric(ctx, state.MetricErrors)
+			_ = w.stateStore.IncrementMetric(ctx, state.MetricProcessed)
+			_ = w.stateStore.PushRecentEvent(ctx, evtState)
+		}
 		return nil, fmt.Errorf("normalization failed: %w", err)
+	}
+
+	evtState.Source = universalEvent.Source.Type
+	if evtState.Source == "" {
+		evtState.Source = universalEvent.Source.Vendor
+	}
+	evtState.Action = universalEvent.Event.Action
+	evtState.ParserName = universalEvent.Metadata.ParserVersion
+	evtState.UniversalEvent = universalEvent
+	evtState.Stages["normalization"] = state.StageResult{ID: "normalization", Label: "Normalization", State: state.StageSuccess, Detail: "Standardized"}
+	evtState.Stages["validation"] = state.StageResult{ID: "validation", Label: "Validation", State: state.StageProcessing}
+	if w.stateStore != nil {
+		_ = w.stateStore.UpdateEventState(ctx, evtState)
 	}
 
 	// 6. JSON Schema Validation
@@ -205,6 +296,15 @@ func (w *Worker) ProcessSingleEvent(ctx context.Context, rawEvent models.RawEven
 	}
 
 	if valResult.Valid {
+		evtState.Stages["validation"] = state.StageResult{ID: "validation", Label: "Validation", State: state.StageSuccess, Detail: "VALID"}
+		evtState.Status = "Parsed"
+		if w.stateStore != nil {
+			_ = w.stateStore.UpdateEventState(ctx, evtState)
+			_ = w.stateStore.IncrementMetric(ctx, state.MetricStable)
+			_ = w.stateStore.IncrementMetric(ctx, state.MetricProcessed)
+			_ = w.stateStore.PushRecentEvent(ctx, evtState)
+		}
+		
 		netDetails := "n/a"
 		if universalEvent.Network != nil {
 			srcPort := 0
@@ -228,6 +328,15 @@ func (w *Worker) ProcessSingleEvent(ctx context.Context, rawEvent models.RawEven
 			universalEvent.Timestamp,
 		)
 	} else {
+		evtState.Stages["validation"] = state.StageResult{ID: "validation", Label: "Validation", State: state.StageWarning, Detail: "INVALID SCHEMA", Error: fmt.Sprintf("%v", valResult.Errors)}
+		evtState.Status = "Error"
+		evtState.ErrorMessage = "Validation failed"
+		if w.stateStore != nil {
+			_ = w.stateStore.UpdateEventState(ctx, evtState)
+			_ = w.stateStore.IncrementMetric(ctx, state.MetricErrors)
+			_ = w.stateStore.IncrementMetric(ctx, state.MetricProcessed)
+			_ = w.stateStore.PushRecentEvent(ctx, evtState)
+		}
 		log.Printf("[Worker] Validation failed for event %s: %v", universalEvent.EventID, valResult.Errors)
 	}
 

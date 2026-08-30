@@ -12,6 +12,7 @@ import (
 type RawEventStore interface {
 	Put(ctx context.Context, event *models.RawEvent) error
 	Get(ctx context.Context, eventID string) (*models.RawEvent, error)
+	Ping(ctx context.Context) error
 	Close() error
 }
 
@@ -51,6 +52,10 @@ func (m *MemoryRawStore) Get(ctx context.Context, eventID string) (*models.RawEv
 	}
 	copied := *event
 	return &copied, nil
+}
+
+func (m *MemoryRawStore) Ping(ctx context.Context) error {
+	return nil
 }
 
 func (m *MemoryRawStore) Close() error {

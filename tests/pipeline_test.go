@@ -72,7 +72,7 @@ func TestFullTargetArchitecture_E2E(t *testing.T) {
 
 	// Ingestion Setup
 	ingestService := ingestion.NewService(rawBuf, "raw_events")
-	ingestHandler := ingestion.NewHandler(ingestService)
+	ingestHandler := ingestion.NewHandler(ingestService, nil, nil)
 
 	// Worker Setup
 	detector := detection.NewDetector()
@@ -92,6 +92,7 @@ func TestFullTargetArchitecture_E2E(t *testing.T) {
 		rawBuf,
 		buffer.NewMemoryIdempotencyStore(),
 		rawStore,
+		nil,
 		detector,
 		driftDetector,
 		parserEngine,
