@@ -176,11 +176,11 @@ func (w *Worker) ProcessSingleEvent(ctx context.Context, rawEvent models.RawEven
 		Status:     "Processing",
 		Stages: map[string]state.StageResult{
 			"ingestion":     {ID: "ingestion", Label: "Ingestion", State: state.StageSuccess, Detail: "OK"},
-			"detection":     {ID: "detection", Label: "Detection", State: state.StageProcessing},
-			"drift":         {ID: "drift", Label: "Drift", State: state.StageIdle},
-			"parsing":       {ID: "parsing", Label: "Parsing", State: state.StageIdle},
-			"normalization": {ID: "normalization", Label: "Normalization", State: state.StageIdle},
-			"validation":    {ID: "validation", Label: "Validation", State: state.StageIdle},
+			"detection":     {ID: "detection", Label: "Detection", State: state.StageProcessing, Detail: "PROCESSING..."},
+			"drift":         {ID: "drift", Label: "Drift", State: state.StageIdle, Detail: "Waiting"},
+			"parsing":       {ID: "parsing", Label: "Parsing", State: state.StageIdle, Detail: "Waiting"},
+			"normalization": {ID: "normalization", Label: "Normalization", State: state.StageIdle, Detail: "Waiting"},
+			"validation":    {ID: "validation", Label: "Validation", State: state.StageIdle, Detail: "Waiting"},
 		},
 	}
 	if w.stateStore != nil {
@@ -209,7 +209,7 @@ func (w *Worker) ProcessSingleEvent(ctx context.Context, rawEvent models.RawEven
 	}
 
 	evtState.Stages["detection"] = state.StageResult{ID: "detection", Label: "Detection", State: detectionState, Detail: detectionDetail}
-	evtState.Stages["drift"] = state.StageResult{ID: "drift", Label: "Drift", State: state.StageProcessing}
+	evtState.Stages["drift"] = state.StageResult{ID: "drift", Label: "Drift", State: state.StageProcessing, Detail: "PROCESSING..."}
 	if w.stateStore != nil {
 		_ = w.stateStore.UpdateEventState(ctx, evtState)
 	}
@@ -241,7 +241,7 @@ func (w *Worker) ProcessSingleEvent(ctx context.Context, rawEvent models.RawEven
 	}
 
 	evtState.Stages["drift"] = state.StageResult{ID: "drift", Label: "Drift", State: state.StageSuccess, Detail: "STABLE"}
-	evtState.Stages["parsing"] = state.StageResult{ID: "parsing", Label: "Parsing", State: state.StageProcessing}
+	evtState.Stages["parsing"] = state.StageResult{ID: "parsing", Label: "Parsing", State: state.StageProcessing, Detail: "PROCESSING..."}
 	if w.stateStore != nil {
 		_ = w.stateStore.UpdateEventState(ctx, evtState)
 	}
@@ -262,7 +262,7 @@ func (w *Worker) ProcessSingleEvent(ctx context.Context, rawEvent models.RawEven
 	}
 
 	evtState.Stages["parsing"] = state.StageResult{ID: "parsing", Label: "Parsing", State: state.StageSuccess, Detail: "Parsed"}
-	evtState.Stages["normalization"] = state.StageResult{ID: "normalization", Label: "Normalization", State: state.StageProcessing}
+	evtState.Stages["normalization"] = state.StageResult{ID: "normalization", Label: "Normalization", State: state.StageProcessing, Detail: "PROCESSING..."}
 	if w.stateStore != nil {
 		_ = w.stateStore.UpdateEventState(ctx, evtState)
 	}
@@ -290,7 +290,7 @@ func (w *Worker) ProcessSingleEvent(ctx context.Context, rawEvent models.RawEven
 	evtState.ParserName = universalEvent.Metadata.ParserVersion
 	evtState.UniversalEvent = universalEvent
 	evtState.Stages["normalization"] = state.StageResult{ID: "normalization", Label: "Normalization", State: state.StageSuccess, Detail: "Standardized"}
-	evtState.Stages["validation"] = state.StageResult{ID: "validation", Label: "Validation", State: state.StageProcessing}
+	evtState.Stages["validation"] = state.StageResult{ID: "validation", Label: "Validation", State: state.StageProcessing, Detail: "PROCESSING..."}
 	if w.stateStore != nil {
 		_ = w.stateStore.UpdateEventState(ctx, evtState)
 	}
