@@ -1,349 +1,260 @@
 # ULPF — Universal Log Processing Framework
 
-ULPF (**Universal Log Processing Framework**) is an extensible, high-throughput log ingestion, raw archiving, and normalization platform built for security operations and network monitoring.
+ULPF (Universal Log Processing Framework) is a high-throughput, extensible platform for log ingestion, immutable raw-event archiving, format detection, parsing, normalization, validation, and downstream integration. 
 
-Heterogeneous devices (firewalls, routers, servers, cloud infrastructure) produce logs in diverse dialects (BSD Syslog, JSON, CSV, CEF, etc.). ULPF decouples downstream analytic engines and security workers from upstream log diversity by buffering raw events, storing an immutable copy in object storage, and normalizing logs into a canonical **Universal Event Schema**.
+Modern security and network environments generate logs from heterogeneous sources such as firewalls, WAFs, IDS/IPS systems, routers, VPNs, servers, and cloud infrastructure. These systems produce events in different formats and vendor-specific dialects (Syslog, JSON, CSV, etc.).
 
----
+ULPF provides a unified processing layer between these sources and downstream systems by converting heterogeneous raw events into a standardized **Universal Event Schema**.
 
-## 1. Target Architecture (Source of Truth)
+## Architecture
+
+The architecture decouples ingestion from processing to handle high throughput, ensuring that all original raw data is immutably archived before it is parsed.
 
 ```text
-                         LOG SOURCES
-        Firewall | WAF | IDS/IPS | VPN | Router | etc.
-                              │
-                              ▼
-                     ┌────────────────┐
-                     │   INGESTION    │
-                     │  (POST /ingest)│
-                     └───────┬────────┘
-                             │
-                             ▼
-                     ┌────────────────┐
-                     │ RAW EVENT      │
-                     │ BUFFER         │
-                     │ Redis Streams  │
-                     │  (raw_events)  │
-                     └───────┬────────┘
-                             │
-                             ▼
-                ┌────────────────────────┐
-                │   PROCESSING WORKERS   │
-                │          GO            │
-                └───────────┬────────────┘
-                            │
-              ┌─────────────┴──────────────┐
-              │                            │
-              ▼                            │
-       ┌──────────────┐                    │
-       │ RAW EVENT    │                    │
-       │ STORE        │                    │
-       │ MinIO / S3   │                    │
-       │ IMMUTABLE    │                    │
-       └──────────────┘                    │
-                                           │
-                                           ▼
-                              ┌────────────────────────┐
-                              │ FORMAT / SOURCE        │
-                              │ DETECTION              │
-                              │ GO                     │
-                              └────────────┬───────────┘
-                                           │
-                                           ▼
-                              ┌────────────────────────┐
-                              │ SCHEMA DRIFT ANALYSIS  │
-                              │                        │
-                              │ MVP: basic/placeholder │
-                              │ Future: intelligent    │
-                              └────────────┬───────────┘
-                                           │
-                              ┌────────────┼────────────┐
-                              │            │            │
-                           STABLE        MINOR       MAJOR/
-                                         DRIFT       UNKNOWN
-                              │            │            │
-                              │            │            ▼
-                              │            │     ┌──────────────┐
-                              │            │     │ AI ESCALATION│
-                              │            │     │   PYTHON     │
-                              │            │     │ Future phase │
-                              │            │     └──────────────┘
-                              │            │
-                              │            ▼
-                              │     Minor Drift Handler
-                              │
-                              └────────────┬───────────────
-                                           ▼
-                              ┌────────────────────────┐
-                              │    PARSER REGISTRY     │
-                              │      PostgreSQL        │
-                              │      Future phase      │
-                              └────────────┬───────────┘
-                                           │
-                                           ▼
-                              ┌────────────────────────┐
-                              │     PARSER ENGINE      │
-                              │          GO            │
-                              └────────────┬───────────┘
-                                           │
-                                           ▼
-                              ┌────────────────────────┐
-                              │     NORMALIZATION      │
-                              │          GO            │
-                              └────────────┬───────────┘
-                                           │
-                                           ▼
-                              ┌────────────────────────┐
-                              │       VALIDATION       │
-                              │     JSON Schema        │
-                              └────────────┬───────────┘
-                                           │
-                                  ┌────────┴────────┐
-                                  ▼                 ▼
-                               VALID             INVALID
-                                  │                 │
-                                  ▼                 ▼
-                         Normalized Store      Quarantine
-                           PostgreSQL           PostgreSQL
-                              │
-                              ▼
-                       Output Connectors
+LOG SOURCES
+Firewall | WAF | IDS/IPS | VPN | Router | Server | Cloud
+        |
+        v
+    INGESTION
+   POST /ingest
+        |
+        v
+  RAW EVENT BUFFER
+   Redis Streams
+    raw_events
+        |
+        v
+ PROCESSING WORKERS
+        Go
+        |
+        +----------------------------+
+        |                            |
+        v                            v
+IMMUTABLE RAW EVENT STORE       PROCESSING PIPELINE
+   MinIO / S3                        |
+                                     v
+                             FORMAT / SOURCE DETECTION
+                                     |
+                                     v
+                             SCHEMA DRIFT ANALYSIS
+                                     |
+                          +----------+----------+
+                          |          |          |
+                       STABLE      MINOR     MAJOR /
+                                              UNKNOWN
+                          |          |          |
+                          |          |          v
+                          |          |     AI ESCALATION
+                          |          |       (Planned)
+                          |          |
+                          +----------+----------+
+                                     |
+                                     v
+                              PARSER REGISTRY
+                                     |
+                                     v
+                               PARSER ENGINE
+                                    Go
+                                     |
+                                     v
+                               NORMALIZATION
+                                    Go
+                                     |
+                                     v
+                                VALIDATION
+                              JSON Schema
+                                     |
+                           +---------+---------+
+                           |                   |
+                         VALID               INVALID
+                           |                   |
+                           v                   v
+            NORMALIZED STORE (Planned)   QUARANTINE STORE (Planned)
+                         |                   |
+                         +---------+---------+
+                                   |
+                                   v
+                           OUTPUT CONNECTORS
+                                   |
+                                   v
+                         SIEM / DATA LAKE / ML
+                         / OTHER CONSUMERS
 ```
 
-> [!IMPORTANT]
-> **Immutable Raw Event Store**: The Raw Event Store (MinIO/S3) is an immutable side-branch. The original raw event is copied to MinIO and is **never** modified by the downstream processing pipeline.
+## Core Data Lifecycle
 
----
+1. **Raw Event -> Immutable Archive**: Every event received is immediately copied to MinIO/S3 as an immutable archive. The downstream processing pipeline MUST NEVER modify the archived original event.
+2. **Raw Event -> Processing**: The raw event is processed, parsed, normalized, and validated.
+3. **Processing -> Normalized Store / Quarantine Store**: Valid events are routed to the Normalized Store. Invalid or unparsed events are routed to the Quarantine Store. Both are persistently stored. 
 
-## 2. Monday MVP Scope
+### Data Quality & Quarantine: No Silent Event Loss
 
-The Monday MVP demonstrates the complete vertical slice:
+The Quarantine Store is a persistent data-quality storage for failed, invalid, malformed, or unparsed events. It tracks information such as: event ID, original event or reference, parser status, validation status, error type, error details, and processing metadata. It is **not** a dead-end drop mechanism.
+
+**ULPF strictly enforces a "no silent event loss" policy.**
+
+For example, if 100 events are received:
+* 95 successfully process -> `Normalized Store`
+* 5 fail validation/parsing -> `Quarantine Store`
+
+All 100 events remain accounted for. Invalid events are not necessarily sent to every downstream consumer; instead, downstream output behavior depends on the configured output policy.
+
+## Processing Pipeline
+
+* **Ingestion**: A Go REST API (`POST /ingest`) receives raw events, assigns event IDs, and publishes to Redis Streams.
+* **Raw Event Buffer**: Redis Streams (`raw_events`) decouples ingestion from processing and supports consumer groups/parallel workers.
+* **Processing Worker**: Go workers consume raw events, coordinate the pipeline, and preserve the immutable raw copy.
+* **Immutable Raw Event Store**: MinIO/S3 stores the original raw event unmodified for audit, replay, forensics, debugging, and reprocessing.
+* **Format / Source Detection**: Identifies event structure/source (currently supporting Syslog, JSON, CSV).
+* **Schema Drift Analysis**: Detects changes in the event structure deterministically.
+* **Parser Registry**: Manages available parsers (currently an in-memory registry, planned for PostgreSQL backing).
+* **Parser Engine**: Format-specific parsers built on a common Go interface.
+* **Normalization**: Maps parsed data to the canonical Universal Event Schema.
+* **Validation**: Enforces strict JSON Schema Validation against the normalized event.
+* **Normalized Store (Planned)**: PostgreSQL store for successfully processed, analytics-ready events.
+* **Quarantine Store (Planned)**: PostgreSQL store for failed/unparsed events and error tracking.
+* **Output Connectors (Planned)**: Feeds SIEM, Data Lakes, and ML pipelines.
+
+## Universal Event Schema
+
+All supported source formats converge into a canonical Universal Event Schema. This ensures that downstream systems consume one stable contract, source-specific complexity stays inside ULPF, and schema versioning protects consumers from breaking changes.
+
+Below is an overview of the required fields in `contracts/universal_event.schema.json` (Draft 2020-12):
+
+* `event_id`: Unique identifier assigned at ingestion.
+* `schema_version`: Must be `"1.0"`.
+* `timestamp`: ISO-8601 string.
+* `source`: Object detailing source `type`, `vendor`, `product`, `identifier`.
+* `event`: Object detailing event `category`, `action`, `severity`.
+* `raw`: The original `format` and `message`.
+* `metadata`: Operational details like `parser_version` and `ingested_at`.
+* *(Optional)* `network`: Details `src_ip`, `dst_ip`, ports, and `protocol`.
+* *(Optional)* `user`: Details like `username`.
+
+## Technology Stack
+
+| Component | Technology | Status |
+| :--- | :--- | :--- |
+| **Ingestion API** | Go | Implemented |
+| **Raw Event Buffer** | Redis Streams | Implemented |
+| **Processing Worker** | Go | Implemented |
+| **Immutable Raw Store** | MinIO / S3 (Memory Fallback) | Implemented |
+| **Parser Engine & Registry** | Go (In-Memory Registry) | Implemented |
+| **Format Parsers** | Go (Syslog, JSON, CSV) | Implemented |
+| **Normalization** | Go | Implemented |
+| **Validation** | JSON Schema | Implemented |
+| **Normalized Store** | PostgreSQL | Planned |
+| **Quarantine Store** | PostgreSQL | Planned |
+| **Output Connectors** | Go | Planned |
+| **AI Escalation / RAG** | Python | Planned |
+
+## Repository Structure
 
 ```text
-Syslog ──┐
-JSON ────┼──→ Ingestion ──→ Redis raw_events ──→ Worker ──┬──→ MinIO (Immutable Raw Copy)
-CSV ─────┘                                                │
-                                                          └──→ Detection ──→ Drift Check ──→ Parser Engine ──→ Normalization ──→ Validation ──→ Universal Event
-```
-
-### What is implemented in the MVP:
-- REST Ingestion API (`POST /ingest`)
-- Redis Streams Raw Buffer (`raw_events`)
-- MinIO / S3 Immutable Raw Event Store (`raw-events/{event_id}.json`)
-- Deterministic Format / Source Detector (Syslog, JSON, CSV)
-- Drift Detector interface (MVP deterministic check)
-- Parser Registry & Parser Engine (Syslog, JSON, CSV)
-- Normalizer generating canonical Universal Event v1.0
-- JSON Schema Draft 2020-12 Validator (`universal_event.schema.json`)
-- Processing Worker with Consumer Group management
-
----
-
-## 3. Technology Split
-
-- **Go**: High-throughput ingestion, Redis stream buffering, processing workers, format detection, parser engine, normalization, schema validation, and storage connectors.
-- **Python (Future Phase)**: Reserved for the intelligence layer: AI escalation, RAG, embeddings, local LLMs, and automated parser generation.
-
----
-
-## 4. Repository Structure
-
-```text
-LogMorph/
+├── .github/          # GitHub workflows and templates
 ├── cmd/
-│   ├── ingestion/
-│   │   └── main.go                 # Ingestion HTTP service entrypoint
-│   └── worker/
-│       └── main.go                 # Processing worker entrypoint
-│
-├── contracts/
-│   ├── raw_event.schema.json       # Inbound RawEvent contract schema
-│   ├── universal_event.schema.json # UniversalEvent JSON Schema (v1.0)
-│   └── worker_event.schema.json    # Worker transport envelope schema
-│
+│   ├── ingestion/    # REST API for receiving events
+│   └── worker/       # Processing pipeline worker
+├── contracts/        # JSON Schemas (universal_event, raw_event, worker_event)
 ├── internal/
-│   ├── buffer/
-│   │   └── redis.go                # Redis Streams raw_events buffer
-│   ├── detection/
-│   │   ├── detector.go             # Format & source detection
-│   │   ├── detector_test.go
-│   │   ├── drift.go                # Drift detector interface & MVP analyzer
-│   │   └── drift_test.go
-│   ├── ingestion/
-│   │   ├── handler.go              # HTTP handlers for /ingest & /health
-│   │   ├── handler_test.go
-│   │   └── service.go              # Ingestion business logic
-│   ├── models/
-│   │   └── event.go                # Shared domain structs
-│   ├── normalization/
-│   │   ├── normalizer.go           # Canonical field normalizer
-│   │   └── normalizer_test.go
-│   ├── parsing/
-│   │   ├── engine.go               # Parser engine
-│   │   ├── parser.go               # Parser interface contract
-│   │   ├── registry.go             # Thread-safe parser registry
-│   │   └── parsers/
-│   │       ├── syslog.go           # Syslog firewall parser
-│   │       ├── syslog_test.go
-│   │       ├── json.go             # JSON firewall parser
-│   │       ├── json_test.go
-│   │       ├── csv.go              # CSV firewall parser
-│   │       └── csv_test.go
-│   ├── storage/
-│   │   └── raw/
-│   │       ├── store.go            # RawEventStore interface & memory store
-│   │       ├── minio.go            # MinIO / S3 immutable store
-│   │       └── store_test.go
-│   ├── validation/
-│   │   ├── universal_event.schema.json
-│   │   ├── validator.go            # JSON Schema validator
-│   │   └── validator_test.go
-│   └── worker/
-│       ├── worker.go               # Processing worker loop
-│       └── worker_test.go
-│
-├── samples/
-│   ├── syslog/                     # Sample log & expected Universal Event
-│   ├── json/
-│   └── csv/
-│
-├── tests/
-│   └── pipeline_test.go            # End-to-end integration tests
-│
-├── docker-compose.yml              # Local Redis + MinIO services
-├── .env.example                    # Environment variable configuration
-├── CONTRIBUTING.md                 # Team guidelines & package boundaries
-├── go.mod
-├── go.sum
-└── README.md
+│   ├── buffer/       # Redis Stream implementation
+│   ├── detection/    # Format/Source detection & drift
+│   ├── ingestion/    # Ingestion service/handlers
+│   ├── models/       # Shared struct definitions
+│   ├── normalization/# Mapping logic to Universal Schema
+│   ├── parsing/      # Engine, Registry, and Parsers (syslog, json, csv)
+│   ├── storage/      # Storage adapters (raw minio/memory)
+│   ├── validation/   # JSON schema validation
+│   └── worker/       # Orchestration logic
+├── samples/          # Sample logs (Syslog, JSON, CSV)
+├── tests/            # E2E Pipeline and integration tests
+├── .env.example      # Example environment variables
+├── .gitignore
+├── CONTRIBUTING.md   # Contribution guidelines
+├── Dockerfile.ingestion
+├── Dockerfile.worker
+├── docker-compose.yml# Infrastructure provisioning
+├── go.mod            # Go dependencies
+└── go.sum
 ```
 
----
-
-## 5. Quickstart Guide
+## Getting Started
 
 ### Prerequisites
-- Go 1.22+ installed
-- Docker & Docker Compose
+* Go 1.21+
+* Docker & Docker Compose
 
-### 1. Start Local Infrastructure (Redis + MinIO)
-```bash
-docker compose up -d
-```
-Verify containers are healthy:
-```bash
-docker compose ps
-```
-- **Redis**: `localhost:6379`
-- **MinIO API**: `localhost:9000`
-- **MinIO Console**: `http://localhost:9001` (User: `minioadmin` / Password: `minioadminpassword`)
+### Running the System
 
-### 2. Start Processing Worker (Terminal 1)
+Start the infrastructure (Redis, MinIO), ingestion API, and the processing worker:
+
 ```bash
-go run ./cmd/worker
+docker-compose up --build
 ```
 
-### 3. Start Ingestion API (Terminal 2)
+The system components will bind to:
+* **Ingestion API**: `http://localhost:8080`
+* **Redis**: `localhost:6379`
+* **MinIO Console**: `http://localhost:9001` (minioadmin / minioadminpassword)
+* **Worker**: Runs in the background consuming from Redis.
+
+## Example Ingestion
+
+You can send a test event to the Ingestion API. ULPF currently supports JSON, Syslog, and CSV payloads.
+
 ```bash
-go run ./cmd/ingestion
-```
-
----
-
-## 6. Example Ingestion Requests
-
-### Syslog Ingestion
-```bash
-curl -i -X POST http://localhost:8080/ingest \
-  -H "Content-Type: application/json" \
-  -d '{
-    "format": "syslog",
-    "source": "firewall-01",
-    "payload": "Aug 28 18:30:12 firewall01 DENY TCP SRC=192.168.1.20:54321 DST=10.0.0.15:443"
-  }'
-```
-
-Response:
-```json
-{
-  "event_id": "evt_b8c8d8a1-8d2b-4e12-a7f4-3d1fa82d02c6",
-  "status": "accepted"
-}
-```
-
-### JSON Ingestion
-```bash
-curl -i -X POST http://localhost:8080/ingest \
+curl -X POST http://localhost:8080/ingest \
   -H "Content-Type: application/json" \
   -d '{
     "format": "json",
-    "source": "firewall-02",
-    "payload": "{\"timestamp\":\"2026-08-28T18:30:12Z\",\"firewall\":{\"action\":\"deny\",\"protocol\":\"TCP\"},\"network\":{\"source\":{\"ip\":\"192.168.1.20\",\"port\":54321},\"destination\":{\"ip\":\"10.0.0.15\",\"port\":443}}}"
+    "source": "firewall-01",
+    "payload": "{\"timestamp\": \"2023-10-25T10:00:00Z\", \"src_ip\": \"192.168.1.100\", \"action\": \"deny\", \"dst_port\": 443}"
   }'
 ```
 
-### CSV Ingestion (Auto-detected Format)
-```bash
-curl -i -X POST http://localhost:8080/ingest \
-  -H "Content-Type: application/json" \
-  -d '{
-    "payload": "timestamp,action,protocol,src_ip,src_port,dst_ip,dst_port\n2026-08-28T18:30:12Z,deny,TCP,192.168.1.20,54321,10.0.0.15,443"
-  }'
-```
-
----
-
-## 7. Normalized Universal Event Output
-
-All formats converge to the canonical Universal Event schema:
-
+You will receive an HTTP 202 Accepted response with the assigned `event_id`:
 ```json
 {
-  "event_id": "evt_b8c8d8a1-8d2b-4e12-a7f4-3d1fa82d02c6",
-  "schema_version": "1.0",
-  "timestamp": "2026-08-28T18:30:12Z",
-  "source": {
-    "type": "firewall",
-    "vendor": "generic",
-    "product": "syslog-firewall",
-    "identifier": "firewall-01"
-  },
-  "event": {
-    "category": "network",
-    "action": "deny",
-    "severity": "high"
-  },
-  "network": {
-    "src_ip": "192.168.1.20",
-    "src_port": 54321,
-    "dst_ip": "10.0.0.15",
-    "dst_port": 443,
-    "protocol": "TCP"
-  },
-  "user": {
-    "username": null
-  },
-  "raw": {
-    "format": "syslog",
-    "message": "Aug 28 18:30:12 firewall01 DENY TCP SRC=192.168.1.20:54321 DST=10.0.0.15:443"
-  },
-  "metadata": {
-    "parser_version": "1.0",
-    "ingested_at": "2026-08-29T00:15:00Z"
-  }
+  "status": "accepted",
+  "event_id": "msg_01H..."
 }
 ```
 
-The worker outputs:
-```text
-[Worker] Processed event evt_b8c8d8a1-8d2b-4e12-a7f4-3d1fa82d02c6 | format: syslog | action: deny | net: 192.168.1.20:54321 -> 10.0.0.15:443 (proto: TCP) | timestamp: 2026-08-28T18:30:12Z
-```
+The worker will automatically pull this event from the `raw_events` Redis stream, save the raw payload to MinIO, and process it through the pipeline.
 
----
+## Testing
 
-## 8. Running Tests
+Run the full End-to-End test suite to verify pipeline convergence for all supported formats:
 
-Run all unit and integration tests:
 ```bash
-go test -v ./...
+go test -v ./tests/...
 ```
+
+You can also run unit tests for internal packages:
+```bash
+go test -v ./internal/...
+```
+
+## Design Principles
+
+* **Immutable Raw Data**: The raw payload is written to an immutable side branch prior to any processing.
+* **No Silent Event Loss**: All events (valid or invalid) must end up in a persistent store.
+* **Decoupled Ingestion/Processing**: Redis Streams ensure spikes in log volume don't overwhelm parsers.
+* **Canonical Events**: Downstream consumers only ever see the Universal Event Schema.
+* **Contract-Driven Validation**: All events are validated via JSON schema before storage.
+* **Fault Isolation**: Parser failures do not crash the worker or lose the event (routed to quarantine).
+* **Intelligence Outside Critical Path**: AI/ML inference (planned) is reserved for asynchronous schema drift analysis or quarantine escalation, keeping the Go pipeline fast.
+
+## Roadmap
+
+Future capabilities planned for ULPF:
+* **Persistent Stores**: Implementation of PostgreSQL-backed Normalized Store, Quarantine Store, and Parser Registry.
+* **Output Connectors**: Connectors for leading SIEMs, Data Lakes, and Webhooks.
+* **Additional Parsers**: Out-of-the-box support for CEF, LEEF, and popular vendor integrations.
+* **Intelligent Drift Analysis**: ML-assisted detection of minor format changes.
+* **AI Escalation**: Python-based local LLM/RAG integration to automatically generate parsers for unknown log formats found in the Quarantine Store.
+* **Horizontal Scaling**: Production hardening for clustered Redis and scaled worker deployments.
+
+## Project Vision
+
+ULPF serves as a universal, high-throughput processing layer between the chaotic ecosystem of heterogeneous log sources and the structured demands of downstream security systems. By maintaining strict schema contracts and guaranteeing zero silent event loss, ULPF enables organizations to adapt to changing infrastructure without continually rewriting downstream SIEM or ML integrations.
