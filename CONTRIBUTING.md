@@ -1,4 +1,4 @@
-# Contributing to ULPF (Universal Log Processing Framework)
+# Contributing to ULPF (Universal Log Processing Framework) 
 
 Welcome to **ULPF**! This document outlines package boundaries, architecture rules, and developer workflows so multiple teammates can collaborate cleanly and in parallel.
 
