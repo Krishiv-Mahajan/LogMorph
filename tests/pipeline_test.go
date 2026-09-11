@@ -17,6 +17,7 @@ import (
 	"github.com/Krishiv-Mahajan/LogMorph/internal/normalization"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/parsing"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/parsing/parsers"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/quarantine"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/raw"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/validation"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/worker"
@@ -88,10 +89,12 @@ func TestFullTargetArchitecture_E2E(t *testing.T) {
 		t.Fatalf("failed to create validator: %v", err)
 	}
 
+	qStore := quarantine.NewMemoryQuarantineStore()
 	w := worker.NewWorker(
 		rawBuf,
 		buffer.NewMemoryIdempotencyStore(),
 		rawStore,
+		qStore,
 		detector,
 		driftDetector,
 		parserEngine,
@@ -216,5 +219,112 @@ func TestFullTargetArchitecture_E2E(t *testing.T) {
 		if evt.Network.DstPort == nil || *evt.Network.DstPort != 443 {
 			t.Errorf("expected DstPort 443, got %v", evt.Network.DstPort)
 		}
+	}
+}
+
+func TestFullTargetArchitecture_Quarantine_E2E(t *testing.T) {
+	rawBuf := &inMemoryBuffer{}
+	rawStore := raw.NewMemoryRawStore()
+	qStore := quarantine.NewMemoryQuarantineStore()
+
+	// Ingestion Setup
+	ingestService := ingestion.NewService(rawBuf, "raw_events")
+	ingestHandler := ingestion.NewHandler(ingestService)
+
+	// Worker Setup
+	detector := detection.NewDetector()
+	driftDetector := detection.NewDriftDetector()
+	registry := parsing.NewRegistry()
+	registry.Register(parsers.NewSyslogParser())
+	registry.Register(parsers.NewJSONParser())
+	registry.Register(parsers.NewCSVParser())
+	parserEngine := parsing.NewEngine(registry)
+	normalizer := normalization.NewNormalizer()
+	validator, err := validation.NewValidator("")
+	if err != nil {
+		t.Fatalf("failed to create validator: %v", err)
+	}
+
+	w := worker.NewWorker(
+		rawBuf,
+		buffer.NewMemoryIdempotencyStore(),
+		rawStore,
+		qStore,
+		detector,
+		driftDetector,
+		parserEngine,
+		normalizer,
+		validator,
+		worker.Config{
+			StreamName:   "raw_events",
+			GroupName:    "test-group",
+			ConsumerName: "test-worker",
+		},
+	)
+
+	// Send invalid payload (malformed JSON)
+	reqBody := ingestion.IngestRequest{
+		Format:  "json",
+		Source:  "firewall-01",
+		Payload: `{"bad_json": "missing_quote}`, // parse failure
+	}
+	reqBytes, _ := json.Marshal(reqBody)
+	req := httptest.NewRequest(http.MethodPost, "/ingest", bytes.NewBuffer(reqBytes))
+	rec := httptest.NewRecorder()
+
+	ingestHandler.HandleIngest(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted, got %d", rec.Code)
+	}
+
+	var ingestResp ingestion.IngestResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &ingestResp)
+
+	// Buffer check
+	if len(rawBuf.messages) == 0 {
+		t.Fatalf("expected message buffered")
+	}
+	_ = rawBuf.messages[0]
+
+	// Create a context to run the worker processing manually to simulate the loop
+	ctx := context.Background()
+
+	// w.Start uses read loop, we can just call processMessages for testing failure routing
+	// But it's private, so let's start the worker with a timeout and wait.
+	ctx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel()
+	_ = w.Start(ctx)
+
+	// Verify immutable raw event is stored
+	storedRaw, err := rawStore.Get(context.Background(), ingestResp.EventID)
+	if err != nil {
+		t.Fatalf("raw event not found: %v", err)
+	}
+	if storedRaw.Payload != `{"bad_json": "missing_quote}` {
+		t.Errorf("stored payload mismatch")
+	}
+
+	// Verify Quarantine Store has the event
+	record, exists := qStore.Get(ingestResp.EventID)
+	if !exists {
+		t.Fatalf("expected quarantine record for failed parse")
+	}
+
+	if record.EventID != ingestResp.EventID {
+		t.Errorf("expected quarantine EventID %s, got %s", ingestResp.EventID, record.EventID)
+	}
+
+	if record.FailureStage != "parsing" {
+		t.Errorf("expected failure_stage 'parsing', got %q", record.FailureStage)
+	}
+
+	if record.FailureReason == "" {
+		t.Errorf("expected failure reason, got empty string")
+	}
+
+	// Verify the message was ACKed because quarantine succeeded
+	if len(rawBuf.acked) != 1 {
+		t.Errorf("expected message to be ACKed, got %v", rawBuf.acked)
 	}
 }

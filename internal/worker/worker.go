@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/Krishiv-Mahajan/LogMorph/internal/models"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/normalization"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/parsing"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/quarantine"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/raw"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/validation"
 )
@@ -27,14 +29,15 @@ type PipelineResult struct {
 
 // Worker coordinates raw event consumption, immutable storage, and the processing pipeline.
 type Worker struct {
-	buffer        buffer.RawBuffer
-	idempotency   buffer.IdempotencyStore
-	rawStore      raw.RawEventStore
-	detector      detection.Detector
-	driftDetector detection.DriftDetector
-	parserEngine  parsing.Engine
-	normalizer    *normalization.Normalizer
-	validator     validation.Validator
+	buffer          buffer.RawBuffer
+	idempotency     buffer.IdempotencyStore
+	rawStore        raw.RawEventStore
+	quarantineStore quarantine.Store
+	detector        detection.Detector
+	driftDetector   detection.DriftDetector
+	parserEngine    parsing.Engine
+	normalizer      *normalization.Normalizer
+	validator       validation.Validator
 
 	streamName   string
 	groupName    string
@@ -104,6 +107,7 @@ func NewWorker(
 	buf buffer.RawBuffer,
 	idempotency buffer.IdempotencyStore,
 	rawStore raw.RawEventStore,
+	quarantineStore quarantine.Store,
 	detector detection.Detector,
 	driftDetector detection.DriftDetector,
 	parserEngine parsing.Engine,
@@ -134,21 +138,22 @@ func NewWorker(
 	}
 
 	w := &Worker{
-		buffer:        buf,
-		idempotency:   idempotency,
-		rawStore:      rawStore,
-		detector:      detector,
-		driftDetector: driftDetector,
-		parserEngine:  parserEngine,
-		normalizer:    normalizer,
-		validator:     validator,
-		streamName:    cfg.StreamName,
-		groupName:     cfg.GroupName,
-		consumerName:  cfg.ConsumerName,
-		lockTTL:       time.Duration(cfg.LockTTLSeconds) * time.Second,
-		doneTTL:       time.Duration(cfg.DoneTTLSeconds) * time.Second,
-		batchSize:     cfg.BatchSize,
-		concurrency:   cfg.Concurrency,
+		buffer:          buf,
+		idempotency:     idempotency,
+		rawStore:        rawStore,
+		quarantineStore: quarantineStore,
+		detector:        detector,
+		driftDetector:   driftDetector,
+		parserEngine:    parserEngine,
+		normalizer:      normalizer,
+		validator:       validator,
+		streamName:      cfg.StreamName,
+		groupName:       cfg.GroupName,
+		consumerName:    cfg.ConsumerName,
+		lockTTL:         time.Duration(cfg.LockTTLSeconds) * time.Second,
+		doneTTL:         time.Duration(cfg.DoneTTLSeconds) * time.Second,
+		batchSize:       cfg.BatchSize,
+		concurrency:     cfg.Concurrency,
 	}
 
 	if cfg.ClaimIdleMs > 0 {
@@ -389,18 +394,33 @@ func (w *Worker) processSingleMessageIdempotent(ctx context.Context, msg buffer.
 	}
 
 	// ── Pipeline ─────────────────────────────────────────────────────────────
-	_, processErr := w.ProcessSingleEvent(ctx, msg.Event)
+	res, processErr := w.ProcessSingleEvent(ctx, msg.Event)
 
+	var qRecord *models.QuarantineRecord
 	if processErr != nil {
 		log.Printf("[Worker] Error processing event %s (msg %s): %v", eventID, msg.ID, processErr)
-		if w.idempotency != nil {
-			// Release the processing lock so another worker can retry via XAUTOCLAIM.
-			if err := w.idempotency.ReleaseProcessing(ctx, eventID); err != nil {
-				log.Printf("[Worker] Warning: failed to release processing lock for %s: %v", eventID, err)
+		qRecord = w.buildQuarantineRecord(msg.Event, processErr)
+	} else if res != nil && !res.Valid {
+		qRecord = w.buildQuarantineRecordFromValidation(msg.Event, res)
+	}
+
+	if qRecord != nil {
+		if w.quarantineStore != nil {
+			if err := w.quarantineStore.Put(ctx, qRecord); err != nil {
+				log.Printf("[Worker] Failed to quarantine event %s: %v", eventID, err)
+				if w.idempotency != nil {
+					// Release the processing lock so another worker can retry via XAUTOCLAIM.
+					if relErr := w.idempotency.ReleaseProcessing(ctx, eventID); relErr != nil {
+						log.Printf("[Worker] Warning: failed to release processing lock for %s: %v", eventID, relErr)
+					}
+				}
+				// Do NOT ACK — message stays in PEL for XAUTOCLAIM-triggered retry.
+				return
 			}
+			log.Printf("[Worker] Successfully quarantined event %s (stage: %s)", eventID, qRecord.FailureStage)
+		} else {
+			log.Printf("[Worker] Warning: quarantine store not configured for failed event %s", eventID)
 		}
-		// Do NOT ACK — message stays in PEL for XAUTOCLAIM-triggered retry.
-		return
 	}
 
 	// ── Mark done + ACK ──────────────────────────────────────────────────────
@@ -418,5 +438,51 @@ func (w *Worker) processSingleMessageIdempotent(ctx context.Context, msg buffer.
 func (w *Worker) ack(ctx context.Context, msg buffer.RawMessage) {
 	if err := w.buffer.Ack(ctx, w.streamName, w.groupName, msg.ID); err != nil {
 		log.Printf("[Worker] Failed to ack message %s: %v", msg.ID, err)
+	}
+}
+
+func (w *Worker) buildQuarantineRecord(event models.RawEvent, err error) *models.QuarantineRecord {
+	stage := "processing"
+	if err != nil {
+		errStr := err.Error()
+		if strings.HasPrefix(errStr, "parsing failed") {
+			stage = "parsing"
+		} else if strings.HasPrefix(errStr, "normalization failed") {
+			stage = "normalization"
+		}
+	}
+
+	return &models.QuarantineRecord{
+		EventID:        event.EventID,
+		ReceivedAt:     event.ReceivedAt,
+		QuarantinedAt:  time.Now().UTC().Format(time.RFC3339),
+		DetectedFormat: event.Format,
+		FailureStage:   stage,
+		FailureReason:  err.Error(),
+		RawEventRef:    fmt.Sprintf("minio://raw-events/%s.json", event.EventID),
+	}
+}
+
+func (w *Worker) buildQuarantineRecordFromValidation(event models.RawEvent, res *PipelineResult) *models.QuarantineRecord {
+	var valErrs []any
+	for _, ve := range res.Errors {
+		valErrs = append(valErrs, ve)
+	}
+
+	format := event.Format
+	if res.UniversalEvent != nil && res.UniversalEvent.Raw.Format != "" {
+		format = res.UniversalEvent.Raw.Format
+	}
+
+	return &models.QuarantineRecord{
+		EventID:          event.EventID,
+		ReceivedAt:       event.ReceivedAt,
+		QuarantinedAt:    time.Now().UTC().Format(time.RFC3339),
+		DetectedFormat:   format,
+		FailureStage:     "validation",
+		FailureReason:    "schema validation failed",
+		ValidationErrors: valErrs,
+		RawEventRef:      fmt.Sprintf("minio://raw-events/%s.json", event.EventID),
+		PartialEvent:     res.UniversalEvent,
 	}
 }
