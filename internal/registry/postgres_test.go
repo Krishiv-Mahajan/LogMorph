@@ -28,6 +28,7 @@ func newIntegrationStore(t *testing.T) (*PostgresStore, *sql.DB) {
 		t.Fatalf("failed to connect to PostgreSQL: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
+	lockIntegrationDB(t, db)
 
 	if err := postgres.Migrate(ctx, db); err != nil {
 		t.Fatalf("failed to migrate: %v", err)
@@ -37,6 +38,35 @@ func newIntegrationStore(t *testing.T) (*PostgresStore, *sql.DB) {
 	}
 
 	return NewPostgresStore(db), db
+}
+
+// integrationLockKey serialises the PostgreSQL integration tests across
+// packages. `go test ./...` runs packages in parallel, and these tests truncate
+// tables that other packages' tests also use, so the shared database has to be
+// held by one package at a time.
+const integrationLockKey = 8274615202912
+
+// lockIntegrationDB takes a session-level advisory lock for the duration of the
+// test. The connection is held open deliberately: the lock lives on the session,
+// so a pooled connection must not be returned while it is held.
+func lockIntegrationDB(t *testing.T, db *sql.DB) {
+	t.Helper()
+
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("failed to acquire a connection for the integration lock: %v", err)
+	}
+	if _, err := conn.ExecContext(context.Background(), `SELECT pg_advisory_lock($1)`, integrationLockKey); err != nil {
+		conn.Close()
+		t.Fatalf("failed to take the integration lock: %v", err)
+	}
+
+	t.Cleanup(func() {
+		if _, err := conn.ExecContext(context.Background(), `SELECT pg_advisory_unlock($1)`, integrationLockKey); err != nil {
+			t.Logf("failed to release the integration lock: %v", err)
+		}
+		conn.Close()
+	})
 }
 
 func TestPostgresStoreVersionChain(t *testing.T) {

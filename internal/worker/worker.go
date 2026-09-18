@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Krishiv-Mahajan/LogMorph/internal/buffer"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/contract"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/detection"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/drift"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/failure"
@@ -17,6 +18,7 @@ import (
 	"github.com/Krishiv-Mahajan/LogMorph/internal/normalization"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/parsing"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/registry"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/review"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/normalized"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/quarantine"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/raw"
@@ -69,6 +71,10 @@ type PipelineResult struct {
 	// Bindings records the values the alias binder contributed.
 	Bindings []drift.Binding
 
+	// Review is the review queue item raised for this event, when its source
+	// needed an escalation decision. Nil otherwise.
+	Review *review.Item
+
 	// Provenance is the traceability block written to the event and its row.
 	Provenance models.Provenance
 }
@@ -85,6 +91,7 @@ type Worker struct {
 	normalizedStore normalized.Store
 	quarantineStore quarantine.Store
 	driftAnalyzer   drift.Analyzer
+	reviewStore     review.Store
 
 	streamName   string
 	groupName    string
@@ -168,6 +175,11 @@ type Config struct {
 	// the worker keeps the pre-registry behaviour: events are parsed from the
 	// detected format and no provenance is recorded.
 	DriftAnalyzer drift.Analyzer
+
+	// ReviewStore receives review queue items for escalating drift. When nil,
+	// escalations are still classified, logged and recorded in provenance, but
+	// no durable queue item is created.
+	ReviewStore review.Store
 }
 
 const (
@@ -232,6 +244,7 @@ func NewWorker(
 		normalizedStore: cfg.NormalizedStore,
 		quarantineStore: cfg.QuarantineStore,
 		driftAnalyzer:   cfg.DriftAnalyzer,
+		reviewStore:     cfg.ReviewStore,
 		streamName:      cfg.StreamName,
 		groupName:       cfg.GroupName,
 		consumerName:    cfg.ConsumerName,
@@ -296,6 +309,15 @@ func (w *Worker) ProcessSingleEvent(ctx context.Context, rawEvent models.RawEven
 	// Provenance is captured before parsing so a parse or validation failure
 	// still records which parser and mapping version was in force.
 	res.Provenance = w.provenanceOf(res)
+
+	// 3c. Review queue: an escalation is a decision the source needs, so it must
+	// be durable before this event is allowed to complete. A failure here is
+	// retryable — the alternative is proceeding as if the decision had been
+	// queued, which would silently lose the review signal.
+	if err := w.recordReview(ctx, rawEvent, res); err != nil {
+		return w.failed(res, failure.Retryable(rawEvent.EventID, failure.StageReview,
+			failure.TypeReviewFailed, err), started)
+	}
 
 	// 4. Parser Engine
 	// Deterministic: the same payload will fail the same way on every attempt,
@@ -388,6 +410,87 @@ func (w *Worker) analyzeSchemaDrift(ctx context.Context, rawEvent models.RawEven
 	}
 
 	return result
+}
+
+// recordReview raises a durable review queue item for an escalating source.
+//
+// It reports an error only when an item was required and could not be written,
+// which the caller turns into a retryable failure. Nothing is written for
+// events that need no decision, so a review-store outage cannot affect stable
+// or minor-drift traffic.
+func (w *Worker) recordReview(ctx context.Context, rawEvent models.RawEvent, res *PipelineResult) error {
+	if w.reviewStore == nil || res.SchemaDrift == nil || !res.SchemaDrift.EscalationRequired {
+		return nil
+	}
+
+	category, wanted := reviewCategory(res.SchemaDrift)
+	if !wanted {
+		return nil
+	}
+
+	mappingID := ""
+	mappingVersion := 0
+	if res.Mapping != nil {
+		mappingID = res.Mapping.MappingID
+		mappingVersion = res.Mapping.MappingVersion
+	}
+
+	stored, err := w.reviewStore.Upsert(ctx, review.Item{
+		Fingerprint:    res.SchemaDrift.Fingerprint,
+		MappingID:      mappingID,
+		MappingVersion: mappingVersion,
+		Category:       category,
+		DriftStatus:    string(res.SchemaDrift.Classification),
+		Reason:         res.SchemaDrift.Reason,
+		Changes:        reviewChanges(res.SchemaDrift.Changes),
+		Origin:         review.OriginDriftEngine,
+		SampleEventID:  rawEvent.EventID,
+	})
+	if err != nil {
+		log.Printf("[Worker] ERROR: failed to queue review for event %s: %v", rawEvent.EventID, err)
+		return err
+	}
+
+	res.Review = stored
+	log.Printf("[Worker] event_id=%s stage=review outcome=queued review_id=%d category=%s signature=%s occurrences=%d",
+		rawEvent.EventID, stored.ReviewID, stored.Category, stored.Signature, stored.Occurrences)
+
+	return nil
+}
+
+// reviewCategory decides whether an escalation warrants a durable queue item,
+// and which kind.
+//
+// An unmapped source needs a decision about how to process it at all. A
+// mapping conflict needs a decision about the contract. A payload that could
+// not be structurally observed at all is neither: it is a per-event data
+// problem, and quarantine already owns that.
+func reviewCategory(result *drift.Result) (review.Category, bool) {
+	switch {
+	case result.Entry == nil:
+		return review.CategoryUnmappedSource, true
+	case len(result.Changes) > 0:
+		return review.CategoryMappingConflict, true
+	default:
+		return "", false
+	}
+}
+
+// reviewChanges converts observed changes into the queue's machine-readable
+// form. The detail text is dropped deliberately: for an ambiguous mapping it
+// embeds the conflicting payload values, and the queue must not become a second
+// store of payload data.
+func reviewChanges(changes []drift.Change) []review.Change {
+	out := make([]review.Change, 0, len(changes))
+	for _, change := range changes {
+		out = append(out, review.Change{
+			Kind:   string(change.Kind),
+			Field:  contract.NormalizeName(change.Field),
+			Target: change.Target,
+			Safe:   change.Safe,
+		})
+	}
+	return out
 }
 
 // provenanceOf builds the traceability block for an event.

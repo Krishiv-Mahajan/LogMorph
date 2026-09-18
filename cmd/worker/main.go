@@ -16,6 +16,7 @@ import (
 	"github.com/Krishiv-Mahajan/LogMorph/internal/parsing"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/parsing/parsers"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/registry"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/review"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/normalized"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/postgres"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/quarantine"
@@ -166,6 +167,7 @@ func main() {
 
 	normalizedStore := normalized.NewPostgresStore(pgDB)
 	quarantineStore := quarantine.NewPostgresStore(pgDB)
+	reviewStore := review.NewPostgresStore(pgDB)
 
 	// 4. Detection
 	detector := detection.NewDetector()
@@ -221,6 +223,7 @@ func main() {
 			NormalizedStore:   normalizedStore,
 			QuarantineStore:   quarantineStore,
 			DriftAnalyzer:     driftEngine,
+			ReviewStore:       reviewStore,
 		},
 	)
 

@@ -31,6 +31,7 @@ const (
 	StageValidation    Stage = "validation"
 	StagePersistence   Stage = "persistence"
 	StageQuarantine    Stage = "quarantine"
+	StageReview        Stage = "review"
 	StageUnknown       Stage = "unknown"
 )
 
@@ -57,6 +58,7 @@ const (
 	TypeRawStoreFailed    = "raw_store_unavailable"
 	TypePersistenceFailed = "persistence_unavailable"
 	TypeQuarantineFailed  = "quarantine_unavailable"
+	TypeReviewFailed      = "review_unavailable"
 	TypeMaxAttempts       = "max_attempts_exceeded"
 	TypeUnknown           = "unknown_error"
 )
