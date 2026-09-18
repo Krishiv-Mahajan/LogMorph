@@ -9,10 +9,13 @@ import (
 
 	"github.com/Krishiv-Mahajan/LogMorph/internal/buffer"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/detection"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/failure"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/models"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/normalization"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/parsing"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/parsing/parsers"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/normalized"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/quarantine"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/raw"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/validation"
 )
@@ -74,17 +77,25 @@ type mockIdempotencyStore struct {
 	doneEvents map[string]bool
 	// Pre-configure TryClaimProcessing for specific eventIDs (false = lock held).
 	claimBlocked map[string]bool
+	// attemptOverrides seeds the attempt counter for specific eventIDs.
+	attemptOverrides map[string]int64
+	// attemptErrors makes RecordAttempt fail for specific eventIDs.
+	attemptErrors map[string]bool
 
 	// Tracking fields (inspected in assertions).
 	claimAttempted []string
 	releasedKeys   []string
 	markedDoneKeys []string
+	attempts       map[string]int64
 }
 
 func newMockIdempotencyStore() *mockIdempotencyStore {
 	return &mockIdempotencyStore{
-		doneEvents:   make(map[string]bool),
-		claimBlocked: make(map[string]bool),
+		doneEvents:       make(map[string]bool),
+		claimBlocked:     make(map[string]bool),
+		attemptOverrides: make(map[string]int64),
+		attemptErrors:    make(map[string]bool),
+		attempts:         make(map[string]int64),
 	}
 }
 
@@ -119,6 +130,19 @@ func (m *mockIdempotencyStore) MarkDone(_ context.Context, eventID string, _ tim
 	return nil
 }
 
+func (m *mockIdempotencyStore) RecordAttempt(_ context.Context, eventID string, _ time.Duration) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.attemptErrors[eventID] {
+		return 0, fmt.Errorf("redis unavailable")
+	}
+	m.attempts[eventID]++
+	if seeded := m.attemptOverrides[eventID]; seeded > m.attempts[eventID] {
+		m.attempts[eventID] = seeded
+	}
+	return m.attempts[eventID], nil
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 func buildParserEngine() parsing.Engine {
@@ -130,7 +154,8 @@ func buildParserEngine() parsing.Engine {
 }
 
 // setupTestWorker creates a worker with a MemoryIdempotencyStore (fully
-// functional, no real Redis needed) and all parsers registered.
+// functional, no real Redis needed), in-memory normalized/quarantine stores,
+// and all parsers registered.
 func setupTestWorker(mockBuf *mockWorkerBuffer, rawStore raw.RawEventStore) (*Worker, error) {
 	return setupTestWorkerWithIdempotency(mockBuf, rawStore, buffer.NewMemoryIdempotencyStore())
 }
@@ -140,13 +165,43 @@ func setupTestWorkerWithIdempotency(
 	rawStore raw.RawEventStore,
 	idempotency buffer.IdempotencyStore,
 ) (*Worker, error) {
+	return setupTestWorkerWithStores(
+		mockBuf, rawStore, idempotency,
+		normalized.NewMemoryStore(), quarantine.NewMemoryStore(),
+		Config{},
+	)
+}
+
+// setupTestWorkerWithStores builds a worker over explicitly supplied stores so
+// tests can assert on persistence and quarantine behaviour. Config fields left
+// empty fall back to the same defaults the other helpers use.
+func setupTestWorkerWithStores(
+	mockBuf *mockWorkerBuffer,
+	rawStore raw.RawEventStore,
+	idempotency buffer.IdempotencyStore,
+	normalizedStore normalized.Store,
+	quarantineStore quarantine.Store,
+	cfg Config,
+) (*Worker, error) {
 	normalizer := normalization.NewNormalizer()
 	validator, err := validation.NewValidator("")
 	if err != nil {
 		return nil, err
 	}
 
-	w := NewWorker(
+	if cfg.StreamName == "" {
+		cfg.StreamName = "raw_events"
+	}
+	if cfg.GroupName == "" {
+		cfg.GroupName = "test-group"
+	}
+	if cfg.ConsumerName == "" {
+		cfg.ConsumerName = "test-worker"
+	}
+	cfg.NormalizedStore = normalizedStore
+	cfg.QuarantineStore = quarantineStore
+
+	return NewWorker(
 		mockBuf,
 		idempotency,
 		rawStore,
@@ -155,13 +210,25 @@ func setupTestWorkerWithIdempotency(
 		buildParserEngine(),
 		normalizer,
 		validator,
-		Config{
-			StreamName:   "raw_events",
-			GroupName:    "test-group",
-			ConsumerName: "test-worker",
-		},
-	)
-	return w, nil
+		cfg,
+	), nil
+}
+
+// waitFor polls cond until it holds or the timeout expires, so tests can
+// assert on work the worker performed on its own goroutines instead of sleeping
+// for a fixed duration.
+func waitFor(t *testing.T, timeout time.Duration, cond func() bool, msg string) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	t.Fatalf("timed out after %s waiting for: %s", timeout, msg)
 }
 
 // syslogMsg returns a realistic test RawMessage.
@@ -379,10 +446,10 @@ func TestIdempotency_LockConflictSkipsWithoutACK(t *testing.T) {
 	}
 }
 
-// TestIdempotency_FailureReleasesLockAndNoACK — when processing fails (no
-// parser registered), the processing lock is released and the message is
-// NOT ACKed so XAUTOCLAIM can retry.
-func TestIdempotency_FailureReleasesLockAndNoACK(t *testing.T) {
+// TestIdempotency_PermanentFailureIsQuarantinedAndACKed — a deterministic
+// processing failure (no parser registered) must not circulate in Redis: the
+// event is quarantined, marked done, and ACKed.
+func TestIdempotency_PermanentFailureIsQuarantinedAndACKed(t *testing.T) {
 	msg := buffer.RawMessage{
 		ID: "msg-4",
 		Event: models.RawEvent{
@@ -397,6 +464,8 @@ func TestIdempotency_FailureReleasesLockAndNoACK(t *testing.T) {
 	mockBuf := &mockWorkerBuffer{messages: []buffer.RawMessage{msg}}
 	idempotency := newMockIdempotencyStore()
 	rawStore := raw.NewMemoryRawStore()
+	normalizedStore := normalized.NewMemoryStore()
+	quarantineStore := quarantine.NewMemoryStore()
 
 	normalizer := normalization.NewNormalizer()
 	validator, err := validation.NewValidator("")
@@ -418,27 +487,58 @@ func TestIdempotency_FailureReleasesLockAndNoACK(t *testing.T) {
 		normalizer,
 		validator,
 		Config{
-			StreamName:   "raw_events",
-			GroupName:    "test-group",
-			ConsumerName: "test-worker",
+			StreamName:      "raw_events",
+			GroupName:       "test-group",
+			ConsumerName:    "test-worker",
+			NormalizedStore: normalizedStore,
+			QuarantineStore: quarantineStore,
 		},
 	)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
 	defer cancel()
 	_ = w.Start(ctx)
 
-	// Must NOT ACK — message should remain in PEL for retry.
-	if len(mockBuf.acked) != 0 {
-		t.Errorf("expected NO ACK on processing failure, got %v", mockBuf.acked)
+	waitFor(t, time.Second, func() bool {
+		count, _ := quarantineStore.Count(context.Background())
+		return count == 1
+	}, "event to be quarantined")
+
+	// Must be ACKed — a permanent failure is terminal, not retried forever.
+	if len(mockBuf.acked) != 1 || mockBuf.acked[0] != "msg-4" {
+		t.Errorf("expected the quarantined message to be ACKed, got %v", mockBuf.acked)
 	}
-	// Processing lock must be released so another worker can retry.
-	if len(idempotency.releasedKeys) == 0 || idempotency.releasedKeys[0] != "evt_fail" {
-		t.Errorf("expected ReleaseProcessing called with evt_fail, got %v", idempotency.releasedKeys)
+
+	entry, err := quarantineStore.Get(context.Background(), "evt_fail")
+	if err != nil {
+		t.Fatalf("expected evt_fail to be quarantined: %v", err)
 	}
-	// MarkDone must NOT be called on failure.
-	if len(idempotency.markedDoneKeys) != 0 {
-		t.Errorf("expected MarkDone NOT called on failure, got %v", idempotency.markedDoneKeys)
+	if entry.Stage != string(failure.StageParsing) {
+		t.Errorf("expected failure stage %q, got %q", failure.StageParsing, entry.Stage)
+	}
+	if entry.Type != failure.TypeParserNotFound {
+		t.Errorf("expected failure type %q, got %q", failure.TypeParserNotFound, entry.Type)
+	}
+	if entry.Class != string(failure.ClassPermanent) {
+		t.Errorf("expected failure class %q, got %q", failure.ClassPermanent, entry.Class)
+	}
+	if entry.RawPayload == nil || entry.RawPayload.Payload != "some raw log data" {
+		t.Errorf("expected the raw payload to be preserved in the quarantine entry")
+	}
+	if entry.RawObjectKey != "evt_fail.json" {
+		t.Errorf("expected raw object key %q, got %q", "evt_fail.json", entry.RawObjectKey)
+	}
+	if entry.StreamID != "msg-4" {
+		t.Errorf("expected stream id %q, got %q", "msg-4", entry.StreamID)
+	}
+
+	// Nothing may reach the normalized store.
+	if count, _ := normalizedStore.Count(context.Background()); count != 0 {
+		t.Errorf("expected no normalized records, got %d", count)
+	}
+	// The lock must be released by MarkDone, not left dangling.
+	if len(idempotency.markedDoneKeys) == 0 || idempotency.markedDoneKeys[0] != "evt_fail" {
+		t.Errorf("expected MarkDone called with evt_fail, got %v", idempotency.markedDoneKeys)
 	}
 }
 
@@ -605,31 +705,17 @@ func TestWorker_PartialFailureInBatch(t *testing.T) {
 
 	mockBuf := &mockWorkerBuffer{messages: messages}
 	rawStore := raw.NewMemoryRawStore()
-	idempotency := buffer.NewMemoryIdempotencyStore()
+	normalizedStore := normalized.NewMemoryStore()
+	quarantineStore := quarantine.NewMemoryStore()
 
-	normalizer := normalization.NewNormalizer()
-	validator, err := validation.NewValidator("")
-	if err != nil {
-		t.Fatalf("validator: %v", err)
-	}
-
-	w := NewWorker(
-		mockBuf,
-		idempotency,
-		rawStore,
-		detection.NewDetector(),
-		detection.NewDriftDetector(),
-		buildParserEngine(),
-		normalizer,
-		validator,
-		Config{
-			StreamName:   "raw_events",
-			GroupName:    "test-group",
-			ConsumerName: "test-worker",
-			BatchSize:    10,
-			Concurrency:  2,
-		},
+	w, err := setupTestWorkerWithStores(
+		mockBuf, rawStore, buffer.NewMemoryIdempotencyStore(),
+		normalizedStore, quarantineStore,
+		Config{BatchSize: 10, Concurrency: 2},
 	)
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
 	defer cancel()
@@ -648,8 +734,10 @@ func TestWorker_PartialFailureInBatch(t *testing.T) {
 	if !ackedSet["msg-valid-2"] {
 		t.Errorf("expected msg-valid-2 to be ACKed")
 	}
-	if ackedSet["msg-bad"] {
-		t.Errorf("expected msg-bad to NOT be ACKed on failure")
+	// The poison pill is quarantined and therefore also ACKed — it must not
+	// block the queue, but it must not be silently dropped either.
+	if !ackedSet["msg-bad"] {
+		t.Errorf("expected msg-bad to be ACKed after quarantine")
 	}
 
 	// Valid events must be in the raw store

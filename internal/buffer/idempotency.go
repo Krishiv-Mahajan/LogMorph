@@ -15,6 +15,9 @@ const (
 	// DefaultDoneKeyPrefix is the Redis key prefix for the completion marker.
 	// Key format: ulpf:done:{event_id}
 	DefaultDoneKeyPrefix = "ulpf:done:"
+	// DefaultAttemptKeyPrefix is the Redis key prefix for the per-event
+	// delivery-attempt counter. Key format: ulpf:attempt:{event_id}
+	DefaultAttemptKeyPrefix = "ulpf:attempt:"
 )
 
 // IdempotencyStore provides atomic idempotency tracking backed by Redis.
@@ -46,6 +49,12 @@ type IdempotencyStore interface {
 
 	// IsDone reports whether eventID was already successfully processed.
 	IsDone(ctx context.Context, eventID string) (bool, error)
+
+	// RecordAttempt increments and returns the number of processing attempts
+	// made for eventID. It bounds how long a retryable failure may keep a
+	// message circulating: once the count reaches the configured maximum the
+	// worker quarantines the event instead of retrying it again.
+	RecordAttempt(ctx context.Context, eventID string, ttl time.Duration) (int64, error)
 }
 
 // ── Redis implementation ──────────────────────────────────────────────────────
@@ -89,6 +98,29 @@ func (r *RedisIdempotencyStore) IsDone(ctx context.Context, eventID string) (boo
 	return n > 0, nil
 }
 
+// RecordAttempt runs INCR ulpf:attempt:{eventID} and sets a TTL on first
+// increment, returning the new attempt count. When Redis is unavailable it
+// returns (0, err); callers treat 0 as "attempt count unknown" rather than as a
+// reason to stop processing.
+func (r *RedisIdempotencyStore) RecordAttempt(ctx context.Context, eventID string, ttl time.Duration) (int64, error) {
+	key := DefaultAttemptKeyPrefix + eventID
+
+	count, err := r.client.Incr(ctx, key).Result()
+	if err != nil {
+		return 0, err
+	}
+
+	// Refresh the TTL only on the first attempt so the window cannot be
+	// extended indefinitely by a retry loop.
+	if count == 1 && ttl > 0 {
+		if err := r.client.Expire(ctx, key, ttl).Err(); err != nil {
+			return count, err
+		}
+	}
+
+	return count, nil
+}
+
 // ── In-memory implementation (for tests and local dev) ───────────────────────
 
 // MemoryIdempotencyStore implements IdempotencyStore in memory.
@@ -98,6 +130,7 @@ type MemoryIdempotencyStore struct {
 	mu         sync.Mutex
 	processing map[string]bool
 	done       map[string]bool
+	attempts   map[string]int64
 }
 
 // NewMemoryIdempotencyStore returns an in-memory IdempotencyStore.
@@ -105,6 +138,7 @@ func NewMemoryIdempotencyStore() *MemoryIdempotencyStore {
 	return &MemoryIdempotencyStore{
 		processing: make(map[string]bool),
 		done:       make(map[string]bool),
+		attempts:   make(map[string]int64),
 	}
 }
 
@@ -142,4 +176,12 @@ func (m *MemoryIdempotencyStore) IsDone(_ context.Context, eventID string) (bool
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.done[eventID], nil
+}
+
+// RecordAttempt increments and returns the in-memory attempt counter.
+func (m *MemoryIdempotencyStore) RecordAttempt(_ context.Context, eventID string, _ time.Duration) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.attempts[eventID]++
+	return m.attempts[eventID], nil
 }

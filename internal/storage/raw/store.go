@@ -15,6 +15,14 @@ type RawEventStore interface {
 	Close() error
 }
 
+// ObjectKey returns the canonical object key under which the immutable raw
+// event is stored. Downstream records (normalized events, quarantine entries)
+// reference the raw payload through this key instead of copying the payload,
+// so the naming lives in exactly one place.
+func ObjectKey(eventID string) string {
+	return fmt.Sprintf("%s.json", eventID)
+}
+
 // MemoryRawStore is an in-memory implementation for testing and fallback.
 type MemoryRawStore struct {
 	events map[string]*models.RawEvent

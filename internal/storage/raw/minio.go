@@ -73,7 +73,7 @@ func (m *MinIORawStore) Put(ctx context.Context, event *models.RawEvent) error {
 		return fmt.Errorf("failed to marshal raw event: %w", err)
 	}
 
-	objectName := fmt.Sprintf("%s.json", event.EventID)
+	objectName := ObjectKey(event.EventID)
 	reader := bytes.NewReader(data)
 
 	_, err = m.client.PutObject(ctx, m.bucket, objectName, reader, int64(len(data)), minio.PutObjectOptions{
@@ -88,7 +88,7 @@ func (m *MinIORawStore) Put(ctx context.Context, event *models.RawEvent) error {
 
 // Get retrieves a RawEvent JSON object by event ID.
 func (m *MinIORawStore) Get(ctx context.Context, eventID string) (*models.RawEvent, error) {
-	objectName := fmt.Sprintf("%s.json", eventID)
+	objectName := ObjectKey(eventID)
 	obj, err := m.client.GetObject(ctx, m.bucket, objectName, minio.GetObjectOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get raw event object: %w", err)

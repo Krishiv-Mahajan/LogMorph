@@ -32,6 +32,27 @@ services:
       retries: 10
       start_period: 30s
 
+  postgres:
+    image: postgres:16-alpine
+    container_name: ulpf-postgres
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      # Local development defaults only — override via the environment (or a
+      # .env file) for anything that is not a throwaway stack.
+      POSTGRES_USER: "${POSTGRES_USER:-logmorph}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-logmorph}"
+      POSTGRES_DB: "${POSTGRES_DB:-logmorph}"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-logmorph} -d ${POSTGRES_DB:-logmorph}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
   ingestion:
     build:
       context: .
@@ -80,13 +101,28 @@ services:
       MINIO_SECRET_KEY: "${MINIO_SECRET_KEY:-minioadminpassword}"
       MINIO_BUCKET: "${MINIO_BUCKET:-raw-events}"
       MINIO_USE_SSL: "${MINIO_USE_SSL:-false}"
+      # PostgreSQL normalized + quarantine store (service name, not localhost).
+      POSTGRES_HOST: "postgres"
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: "${POSTGRES_USER:-logmorph}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-logmorph}"
+      POSTGRES_DB: "${POSTGRES_DB:-logmorph}"
+      POSTGRES_SSLMODE: "${POSTGRES_SSLMODE:-disable}"
+      # Bounds retries of a retryable failure before it is quarantined.
+      WORKER_MAX_ATTEMPTS: "${WORKER_MAX_ATTEMPTS:-10}"
+      WORKER_ATTEMPT_TTL_S: "${WORKER_ATTEMPT_TTL_S:-86400}"
     depends_on:
       redis:
         condition: service_healthy
       minio:
+        condition: service_healthy
+      # The worker applies schema migrations at startup, so the database must
+      # be accepting connections, not merely started.
+      postgres:
         condition: service_healthy
     restart: unless-stopped
 
 volumes:
   redis-data:
   minio-data:
+  postgres-data:

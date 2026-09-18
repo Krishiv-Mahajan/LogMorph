@@ -14,9 +14,19 @@ import (
 	"github.com/Krishiv-Mahajan/LogMorph/internal/normalization"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/parsing"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/parsing/parsers"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/normalized"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/postgres"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/quarantine"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/raw"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/validation"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/worker"
+)
+
+// postgresConnectAttempts / Delay bound how long worker startup waits for
+// PostgreSQL. Later failures are handled per-event by the retry semantics.
+const (
+	postgresConnectAttempts = 15
+	postgresConnectDelay    = 2 * time.Second
 )
 
 func main() {
@@ -79,6 +89,14 @@ func main() {
 	// WORKER_CONCURRENCY is the max number of events processed in parallel (default 4).
 	concurrency, _ := strconv.ParseInt(os.Getenv("WORKER_CONCURRENCY"), 10, 64)
 
+	// WORKER_MAX_ATTEMPTS caps retries of a retryable (infrastructure) failure.
+	// Once the cap is reached the event is quarantined rather than retried
+	// forever. 0 disables the cap. Default: 10.
+	maxAttempts, _ := strconv.ParseInt(os.Getenv("WORKER_MAX_ATTEMPTS"), 10, 64)
+
+	// WORKER_ATTEMPT_TTL_S is the TTL of the per-event attempt counter (default 86400 s).
+	attemptTTL, _ := strconv.ParseInt(os.Getenv("WORKER_ATTEMPT_TTL_S"), 10, 64)
+
 	log.Printf("[Worker] Initializing ULPF Processing Worker (Redis: %s, Stream: %s, Group: %s)...",
 		redisAddr, rawStream, groupName)
 
@@ -126,27 +144,48 @@ func main() {
 	}
 	defer rawStore.Close()
 
-	// 3. Detection & Drift
+	// 3. PostgreSQL: normalized event store + quarantine store
+	pgCfg := postgres.ConfigFromEnv()
+
+	ctxPG, cancelPG := context.WithTimeout(context.Background(), 60*time.Second)
+	pgDB, err := postgres.OpenWithRetry(ctxPG, pgCfg, postgresConnectAttempts, postgresConnectDelay)
+	cancelPG()
+	if err != nil {
+		// The normalized store is the terminal destination of the pipeline:
+		// running without it would consume events that go nowhere.
+		log.Fatalf("[Worker] Failed to connect to PostgreSQL at %s: %v", pgCfg.Redacted(), err)
+	}
+	defer pgDB.Close()
+	log.Printf("[Worker] Connected to PostgreSQL (%s)", pgCfg.Redacted())
+
+	if err := postgres.Migrate(context.Background(), pgDB); err != nil {
+		log.Fatalf("[Worker] Failed to apply database migrations: %v", err)
+	}
+
+	normalizedStore := normalized.NewPostgresStore(pgDB)
+	quarantineStore := quarantine.NewPostgresStore(pgDB)
+
+	// 4. Detection & Drift
 	detector := detection.NewDetector()
 	driftDetector := detection.NewDriftDetector()
 
-	// 4. Parser Engine & Registry
+	// 5. Parser Engine & Registry
 	registry := parsing.NewRegistry()
 	registry.Register(parsers.NewSyslogParser())
 	registry.Register(parsers.NewJSONParser())
 	registry.Register(parsers.NewCSVParser())
 	parserEngine := parsing.NewEngine(registry)
 
-	// 5. Normalizer
+	// 6. Normalizer
 	normalizer := normalization.NewNormalizer()
 
-	// 6. JSON Schema Validator
+	// 7. JSON Schema Validator
 	validator, err := validation.NewValidator("")
 	if err != nil {
 		log.Fatalf("[Worker] Failed to initialize JSON Schema validator: %v", err)
 	}
 
-	// 7. Worker Instance
+	// 8. Worker Instance
 	w := worker.NewWorker(
 		rawBuffer,
 		idempotencyStore,
@@ -157,14 +196,18 @@ func main() {
 		normalizer,
 		validator,
 		worker.Config{
-			StreamName:     rawStream,
-			GroupName:      groupName,
-			ConsumerName:   consumerName,
-			ClaimIdleMs:    claimIdleMs,
-			LockTTLSeconds: lockTTL,
-			DoneTTLSeconds: doneTTL,
-			BatchSize:      batchSize,
-			Concurrency:    concurrency,
+			StreamName:        rawStream,
+			GroupName:         groupName,
+			ConsumerName:      consumerName,
+			ClaimIdleMs:       claimIdleMs,
+			LockTTLSeconds:    lockTTL,
+			DoneTTLSeconds:    doneTTL,
+			AttemptTTLSeconds: attemptTTL,
+			MaxAttempts:       maxAttempts,
+			BatchSize:         batchSize,
+			Concurrency:       concurrency,
+			NormalizedStore:   normalizedStore,
+			QuarantineStore:   quarantineStore,
 		},
 	)
 

@@ -111,9 +111,32 @@ All 100 events remain accounted for. Invalid events are not necessarily sent to 
 * **Parser Engine**: Format-specific parsers built on a common Go interface.
 * **Normalization**: Maps parsed data to the canonical Universal Event Schema.
 * **Validation**: Enforces strict JSON Schema Validation against the normalized event.
-* **Normalized Store (Planned)**: PostgreSQL store for successfully processed, analytics-ready events.
-* **Quarantine Store (Planned)**: PostgreSQL store for failed/unparsed events and error tracking.
+* **Normalized Store**: PostgreSQL store for successfully processed, analytics-ready events.
+* **Quarantine Store**: PostgreSQL store for failed/unparsed events and error tracking.
 * **Output Connectors (Planned)**: Feeds SIEM, Data Lakes, and ML pipelines.
+
+### Failure Classification & Retry Semantics
+
+Every event ends a processing attempt with exactly one outcome, and the Redis
+ACK/retry decision follows from it:
+
+| Outcome | Meaning | Redis behaviour |
+| :--- | :--- | :--- |
+| `SUCCESS` | Parsed, normalized, validated, and persisted. | Marked done, ACKed. |
+| `QUARANTINED` | Deterministic failure (malformed payload, no parser, schema violation). | Written to `quarantined_events`, marked done, ACKed. |
+| `RETRYABLE_FAILURE` | Infrastructure failure (MinIO, PostgreSQL). | Lock released, **not** ACKed — XAUTOCLAIM redelivers it. |
+
+Classification is stage-driven: parsing, normalization, and validation are
+deterministic, so their failures are permanent and quarantined immediately.
+Raw-store and persistence failures depend on external systems and are retried,
+up to `WORKER_MAX_ATTEMPTS` attempts, after which the event is quarantined as
+`max_attempts_exceeded` rather than retried forever. A quarantined event is
+never left in Redis, and a retryable failure is never quarantined.
+
+Persistence is idempotent at the database level (`PRIMARY KEY (event_id)` with
+`ON CONFLICT DO NOTHING`), so a retried or re-delivered event cannot create a
+second normalized row. Duplicate-suppression is independent of the Redis
+done-marker, so it holds across restarts and after the marker expires.
 
 ## Universal Event Schema
 
@@ -143,8 +166,8 @@ Below is an overview of the required fields in `contracts/universal_event.schema
 | **Format Parsers** | Go (Syslog, JSON, CSV) | Implemented |
 | **Normalization** | Go | Implemented |
 | **Validation** | JSON Schema | Implemented |
-| **Normalized Store** | PostgreSQL | Planned |
-| **Quarantine Store** | PostgreSQL | Planned |
+| **Normalized Store** | PostgreSQL | Implemented |
+| **Quarantine Store** | PostgreSQL | Implemented |
 | **Output Connectors** | Go | Planned |
 | **AI Escalation / RAG** | Python | Planned |
 
@@ -159,11 +182,16 @@ Below is an overview of the required fields in `contracts/universal_event.schema
 ├── internal/
 │   ├── buffer/       # Redis Stream implementation
 │   ├── detection/    # Format/Source detection & drift
+│   ├── failure/      # Error classification (permanent vs retryable)
 │   ├── ingestion/    # Ingestion service/handlers
 │   ├── models/       # Shared struct definitions
 │   ├── normalization/# Mapping logic to Universal Schema
 │   ├── parsing/      # Engine, Registry, and Parsers (syslog, json, csv)
-│   ├── storage/      # Storage adapters (raw minio/memory)
+│   ├── storage/      # Storage adapters
+│   │   ├── normalized/#   PostgreSQL normalized event store (+ memory)
+│   │   ├── postgres/  #    Connection pool & embedded migrations
+│   │   ├── quarantine/#   PostgreSQL dead-letter store (+ memory)
+│   │   └── raw/       #   Immutable raw store (minio/memory)
 │   ├── validation/   # JSON schema validation
 │   └── worker/       # Orchestration logic
 ├── samples/          # Sample logs (Syslog, JSON, CSV)
@@ -186,17 +214,23 @@ Below is an overview of the required fields in `contracts/universal_event.schema
 
 ### Running the System
 
-Start the infrastructure (Redis, MinIO), ingestion API, and the processing worker:
+Start the infrastructure (Redis, MinIO, PostgreSQL), ingestion API, and the processing worker:
 
 ```bash
 docker-compose up --build
 ```
 
+The worker applies the database migrations at startup, so no manual schema
+setup is required.
+
 The system components will bind to:
 * **Ingestion API**: `http://localhost:8080`
 * **Redis**: `localhost:6379`
 * **MinIO Console**: `http://localhost:9001` (minioadmin / minioadminpassword)
+* **PostgreSQL**: `localhost:5432` (logmorph / logmorph — local defaults, override via `.env`)
 * **Worker**: Runs in the background consuming from Redis.
+
+All credentials are read from the environment; see `.env.example`.
 
 ## Example Ingestion
 
@@ -222,6 +256,21 @@ You will receive an HTTP 202 Accepted response with the assigned `event_id`:
 
 The worker will automatically pull this event from the `raw_events` Redis stream, save the raw payload to MinIO, and process it through the pipeline.
 
+Validated events land in PostgreSQL:
+
+```bash
+docker-compose exec postgres psql -U logmorph -d logmorph \
+  -c "SELECT event_id, event_action, src_ip, raw_object_key FROM normalized_events"
+```
+
+Events that fail permanently land in the quarantine store with the failure
+stage, failure type, error, attempt count, and a reference to the raw object:
+
+```bash
+docker-compose exec postgres psql -U logmorph -d logmorph \
+  -c "SELECT event_id, failure_stage, failure_type, error_message FROM quarantined_events"
+```
+
 ## Testing
 
 Run the full End-to-End test suite to verify pipeline convergence for all supported formats:
@@ -233,6 +282,14 @@ go test -v ./tests/...
 You can also run unit tests for internal packages:
 ```bash
 go test -v ./internal/...
+```
+
+The PostgreSQL store tests are integration tests: they skip unless a database is
+provided, so the default run needs no services.
+
+```bash
+TEST_POSTGRES_DSN="postgres://logmorph:logmorph@localhost:5432/logmorph?sslmode=disable" \
+  go test -v ./internal/storage/...
 ```
 
 ## Design Principles

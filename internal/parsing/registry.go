@@ -1,10 +1,16 @@
 package parsing
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 )
+
+// ErrParserNotFound marks a lookup for a format that has no registered parser.
+// Callers wrap it so the failure can be classified apart from a payload that a
+// parser rejected.
+var ErrParserNotFound = errors.New("parser not found")
 
 // normalizeFormat trims whitespace and converts to lower case for defensive lookup.
 func normalizeFormat(format string) string {
@@ -51,7 +57,7 @@ func (r *Registry) Get(format string) (Parser, error) {
 
 	p, exists := r.parsers[key]
 	if !exists {
-		return nil, fmt.Errorf("no parser registered for format: %s", format)
+		return nil, fmt.Errorf("%w for format: %s", ErrParserNotFound, format)
 	}
 	return p, nil
 }

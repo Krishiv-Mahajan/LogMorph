@@ -2,18 +2,42 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/Krishiv-Mahajan/LogMorph/internal/buffer"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/detection"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/failure"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/models"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/normalization"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/parsing"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/normalized"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/quarantine"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/raw"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/validation"
+)
+
+// Outcome is the explicit result of running one event through the pipeline. The
+// worker's ACK/retry decision is driven entirely by this value.
+type Outcome string
+
+const (
+	// OutcomeSuccess: the event was parsed, normalized, validated, and stored.
+	// The message is marked done and ACKed.
+	OutcomeSuccess Outcome = "SUCCESS"
+
+	// OutcomeQuarantined: the event failed deterministically. It is recorded in
+	// the quarantine store, marked done, and ACKed so it cannot circulate in
+	// Redis forever.
+	OutcomeQuarantined Outcome = "QUARANTINED"
+
+	// OutcomeRetryableFailure: an infrastructure dependency failed. The message
+	// is left in the Redis pending list for XAUTOCLAIM to redeliver.
+	OutcomeRetryableFailure Outcome = "RETRYABLE_FAILURE"
 )
 
 // PipelineResult represents the outcome of running a RawEvent through the processing pipeline.
@@ -23,18 +47,30 @@ type PipelineResult struct {
 	Valid          bool
 	Errors         []validation.ValidationError
 	Drift          models.DriftResult
+
+	// Outcome is the explicit processing outcome (see Outcome constants).
+	Outcome Outcome
+
+	// Failure describes how the pipeline failed. Nil when Outcome is
+	// OutcomeSuccess.
+	Failure *failure.Error
+
+	// Duration is the wall-clock time spent processing the event.
+	Duration time.Duration
 }
 
 // Worker coordinates raw event consumption, immutable storage, and the processing pipeline.
 type Worker struct {
-	buffer        buffer.RawBuffer
-	idempotency   buffer.IdempotencyStore
-	rawStore      raw.RawEventStore
-	detector      detection.Detector
-	driftDetector detection.DriftDetector
-	parserEngine  parsing.Engine
-	normalizer    *normalization.Normalizer
-	validator     validation.Validator
+	buffer          buffer.RawBuffer
+	idempotency     buffer.IdempotencyStore
+	rawStore        raw.RawEventStore
+	detector        detection.Detector
+	driftDetector   detection.DriftDetector
+	parserEngine    parsing.Engine
+	normalizer      *normalization.Normalizer
+	validator       validation.Validator
+	normalizedStore normalized.Store
+	quarantineStore quarantine.Store
 
 	streamName   string
 	groupName    string
@@ -51,6 +87,13 @@ type Worker struct {
 
 	// doneTTL is the TTL for the "successfully processed" marker in Redis.
 	doneTTL time.Duration
+
+	// attemptTTL is the TTL for the per-event attempt counter in Redis.
+	attemptTTL time.Duration
+
+	// maxAttempts bounds retries of a retryable failure. 0 disables the bound
+	// (retry indefinitely).
+	maxAttempts int64
 
 	// batchSize is the maximum number of messages fetched per ReadGroup /
 	// ClaimPending call. Configurable via WORKER_BATCH_SIZE (default 10).
@@ -80,6 +123,16 @@ type Config struct {
 	// Events processed within this window won't be reprocessed. Default: 86400 s.
 	DoneTTLSeconds int64
 
+	// AttemptTTLSeconds is the TTL of the per-event attempt counter. It should
+	// comfortably exceed the retry window of a transient outage.
+	// Default: 86400 s.
+	AttemptTTLSeconds int64
+
+	// MaxAttempts quarantines an event whose retryable failure persists across
+	// this many attempts, so a permanent infrastructure fault cannot keep a
+	// message in Redis forever. 0 disables the bound. Default: 10.
+	MaxAttempts int64
+
 	// BatchSize is the maximum number of messages fetched per ReadGroup /
 	// ClaimPending call. Default: 10.
 	BatchSize int64
@@ -87,13 +140,24 @@ type Config struct {
 	// Concurrency is the maximum number of messages processed in parallel.
 	// Default: 4.
 	Concurrency int64
+
+	// NormalizedStore receives validated UniversalEvents. When nil, validated
+	// events are not persisted (test/opt-out mode).
+	NormalizedStore normalized.Store
+
+	// QuarantineStore receives events that failed permanently. When nil,
+	// permanent failures cannot be recorded and are left in Redis rather than
+	// being discarded.
+	QuarantineStore quarantine.Store
 }
 
 const (
-	defaultLockTTLSeconds = 120
-	defaultDoneTTLSeconds = 86400
-	defaultBatchSize      = 10
-	defaultConcurrency    = 4
+	defaultLockTTLSeconds    = 120
+	defaultDoneTTLSeconds    = 86400
+	defaultAttemptTTLSeconds = 86400
+	defaultMaxAttempts       = 10
+	defaultBatchSize         = 10
+	defaultConcurrency       = 4
 )
 
 // NewWorker initialises a processing worker.
@@ -126,6 +190,12 @@ func NewWorker(
 	if cfg.DoneTTLSeconds <= 0 {
 		cfg.DoneTTLSeconds = defaultDoneTTLSeconds
 	}
+	if cfg.AttemptTTLSeconds <= 0 {
+		cfg.AttemptTTLSeconds = defaultAttemptTTLSeconds
+	}
+	if cfg.MaxAttempts <= 0 {
+		cfg.MaxAttempts = defaultMaxAttempts
+	}
 	if cfg.BatchSize <= 0 {
 		cfg.BatchSize = defaultBatchSize
 	}
@@ -134,21 +204,25 @@ func NewWorker(
 	}
 
 	w := &Worker{
-		buffer:        buf,
-		idempotency:   idempotency,
-		rawStore:      rawStore,
-		detector:      detector,
-		driftDetector: driftDetector,
-		parserEngine:  parserEngine,
-		normalizer:    normalizer,
-		validator:     validator,
-		streamName:    cfg.StreamName,
-		groupName:     cfg.GroupName,
-		consumerName:  cfg.ConsumerName,
-		lockTTL:       time.Duration(cfg.LockTTLSeconds) * time.Second,
-		doneTTL:       time.Duration(cfg.DoneTTLSeconds) * time.Second,
-		batchSize:     cfg.BatchSize,
-		concurrency:   cfg.Concurrency,
+		buffer:          buf,
+		idempotency:     idempotency,
+		rawStore:        rawStore,
+		detector:        detector,
+		driftDetector:   driftDetector,
+		parserEngine:    parserEngine,
+		normalizer:      normalizer,
+		validator:       validator,
+		normalizedStore: cfg.NormalizedStore,
+		quarantineStore: cfg.QuarantineStore,
+		streamName:      cfg.StreamName,
+		groupName:       cfg.GroupName,
+		consumerName:    cfg.ConsumerName,
+		lockTTL:         time.Duration(cfg.LockTTLSeconds) * time.Second,
+		doneTTL:         time.Duration(cfg.DoneTTLSeconds) * time.Second,
+		attemptTTL:      time.Duration(cfg.AttemptTTLSeconds) * time.Second,
+		maxAttempts:     cfg.MaxAttempts,
+		batchSize:       cfg.BatchSize,
+		concurrency:     cfg.Concurrency,
 	}
 
 	if cfg.ClaimIdleMs > 0 {
@@ -158,14 +232,29 @@ func NewWorker(
 	return w
 }
 
-// ProcessSingleEvent executes the immutable raw store copy and full processing
-// pipeline for one event. It does NOT perform idempotency checks — those are
-// handled by the caller (processSingleMessageIdempotent).
+// ProcessSingleEvent executes the immutable raw store copy, the full processing
+// pipeline, and persistence of the normalized event for one event. It does NOT
+// perform idempotency checks, ACK, or quarantine — those are handled by the
+// caller (processSingleMessageIdempotent).
+//
+// The returned result is never nil and always carries an Outcome, so a caller
+// cannot mistake a deterministic failure (invalid event) for success. The
+// returned error is non-nil exactly when the outcome is not OutcomeSuccess.
 func (w *Worker) ProcessSingleEvent(ctx context.Context, rawEvent models.RawEvent) (*PipelineResult, error) {
+	started := time.Now()
+
+	res := &PipelineResult{
+		EventID: rawEvent.EventID,
+		Outcome: OutcomeSuccess,
+	}
+
 	// 1. Immutable Raw Event Store (side-branch; path: raw-events/{event_id}.json)
+	// A failure here is retryable: downstream records reference this object, so
+	// storing them without it would leave a dangling reference.
 	if w.rawStore != nil {
 		if err := w.rawStore.Put(ctx, &rawEvent); err != nil {
-			log.Printf("[Worker] Warning: failed to persist raw event %s to MinIO: %v", rawEvent.EventID, err)
+			return w.failed(res, failure.Retryable(rawEvent.EventID, failure.StageRawStore,
+				failure.TypeRawStoreFailed, err), started)
 		}
 	}
 
@@ -175,63 +264,109 @@ func (w *Worker) ProcessSingleEvent(ctx context.Context, rawEvent models.RawEven
 	// 3. Drift Analysis
 	driftRes, err := w.driftDetector.Analyze(ctx, rawEvent, detectionRes)
 	if err != nil {
-		log.Printf("[Worker] Drift analysis error for event %s: %v", rawEvent.EventID, err)
+		log.Printf("[Worker] event_id=%s stage=drift outcome=degraded error=%q", rawEvent.EventID, err)
 	}
 	if driftRes.Status == models.DriftStatusUnknown || driftRes.Status == models.DriftStatusMajorDrift {
-		log.Printf("[Worker] Drift alert: event %s classified as %s (%s)", rawEvent.EventID, driftRes.Status, driftRes.Message)
+		log.Printf("[Worker] event_id=%s stage=drift outcome=alert status=%s reason=%q",
+			rawEvent.EventID, driftRes.Status, driftRes.Message)
 	}
+	res.Drift = driftRes
 
 	// 4. Parser Engine
+	// Deterministic: the same payload will fail the same way on every attempt,
+	// so a parse failure is permanent rather than retryable.
 	parsedEvent, err := w.parserEngine.Parse(ctx, rawEvent, detectionRes)
 	if err != nil {
-		return nil, fmt.Errorf("parsing failed: %w", err)
+		return w.failed(res, classifyParseFailure(rawEvent.EventID, err), started)
 	}
 
 	// 5. Normalization
+	// Deterministic, like parsing.
 	universalEvent, err := w.normalizer.Normalize(rawEvent, parsedEvent, detectionRes)
 	if err != nil {
-		return nil, fmt.Errorf("normalization failed: %w", err)
+		return w.failed(res, failure.Permanent(rawEvent.EventID, failure.StageNormalization,
+			failure.TypeNormalizeFailed, err), started)
 	}
+	res.UniversalEvent = universalEvent
+	res.EventID = universalEvent.EventID
 
 	// 6. JSON Schema Validation
 	valResult := w.validator.Validate(universalEvent)
+	res.Valid = valResult.Valid
+	res.Errors = valResult.Errors
 
-	res := &PipelineResult{
-		EventID:        universalEvent.EventID,
-		UniversalEvent: universalEvent,
-		Valid:          valResult.Valid,
-		Errors:         valResult.Errors,
-		Drift:          driftRes,
+	if !valResult.Valid {
+		return w.failed(res, failure.Permanent(universalEvent.EventID, failure.StageValidation,
+			failure.TypeValidationFailed, fmt.Errorf("schema validation failed: %s", formatValidationErrors(valResult.Errors))), started)
 	}
 
-	if valResult.Valid {
-		netDetails := "n/a"
-		if universalEvent.Network != nil {
-			srcPort := 0
-			if universalEvent.Network.SrcPort != nil {
-				srcPort = *universalEvent.Network.SrcPort
-			}
-			dstPort := 0
-			if universalEvent.Network.DstPort != nil {
-				dstPort = *universalEvent.Network.DstPort
-			}
-			netDetails = fmt.Sprintf("%s:%d -> %s:%d (proto: %s)",
-				universalEvent.Network.SrcIP, srcPort,
-				universalEvent.Network.DstIP, dstPort,
-				universalEvent.Network.Protocol)
+	// 7. Normalized Event Store (PostgreSQL)
+	if w.normalizedStore != nil {
+		_, err := w.normalizedStore.Save(ctx, normalized.Record{
+			Event:        universalEvent,
+			RawObjectKey: raw.ObjectKey(universalEvent.EventID),
+			ReceivedAt:   parseReceivedAt(rawEvent.ReceivedAt),
+		})
+		if err != nil {
+			return w.failed(res, failure.Retryable(universalEvent.EventID, failure.StagePersistence,
+				failure.TypePersistenceFailed, err), started)
 		}
-		log.Printf("[Worker] Processed event %s | format: %s | action: %s | net: %s | timestamp: %s",
-			universalEvent.EventID,
-			universalEvent.Raw.Format,
-			universalEvent.Event.Action,
-			netDetails,
-			universalEvent.Timestamp,
-		)
-	} else {
-		log.Printf("[Worker] Validation failed for event %s: %v", universalEvent.EventID, valResult.Errors)
 	}
+
+	res.Duration = time.Since(started)
 
 	return res, nil
+}
+
+// failed records a classified failure on the result and returns it together
+// with the error, so the caller can act on either.
+func (w *Worker) failed(res *PipelineResult, f *failure.Error, started time.Time) (*PipelineResult, error) {
+	res.Failure = f
+	res.Duration = time.Since(started)
+
+	if f.Class == failure.ClassPermanent {
+		res.Outcome = OutcomeQuarantined
+	} else {
+		res.Outcome = OutcomeRetryableFailure
+	}
+
+	return res, f
+}
+
+// classifyParseFailure maps a parser-engine error to a failure type. Neither a
+// missing parser nor an unparseable payload becomes parseable by trying again,
+// so both are permanent; the type code distinguishes the two for triage.
+func classifyParseFailure(eventID string, err error) *failure.Error {
+	if errors.Is(err, parsing.ErrParserNotFound) {
+		return failure.Permanent(eventID, failure.StageParsing, failure.TypeParserNotFound, err)
+	}
+	return failure.Permanent(eventID, failure.StageParsing, failure.TypeParseFailed, err)
+}
+
+// formatValidationErrors renders schema violations into a single readable
+// string for the quarantine record.
+func formatValidationErrors(errs []validation.ValidationError) string {
+	if len(errs) == 0 {
+		return "no validation details"
+	}
+	out := make([]string, 0, len(errs))
+	for _, e := range errs {
+		out = append(out, fmt.Sprintf("%s: %s", e.Field, e.Message))
+	}
+	return strings.Join(out, "; ")
+}
+
+// parseReceivedAt parses the ingestion timestamp into a time.Time, returning
+// the zero time when it cannot be parsed.
+func parseReceivedAt(value string) time.Time {
+	if value == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return time.Time{}
+	}
+	return t.UTC()
 }
 
 // Start runs the continuous worker consumer loop until context cancellation.
@@ -259,8 +394,14 @@ func (w *Worker) Start(ctx context.Context) error {
 	}
 
 	if w.idempotency != nil {
-		log.Printf("[Worker] Idempotency enabled: lock TTL=%s, done TTL=%s",
-			w.lockTTL, w.doneTTL)
+		log.Printf("[Worker] Idempotency enabled: lock TTL=%s, done TTL=%s, attempt TTL=%s, max attempts=%d",
+			w.lockTTL, w.doneTTL, w.attemptTTL, w.maxAttempts)
+	}
+	if w.normalizedStore == nil {
+		log.Printf("[Worker] Warning: no normalized store configured — validated events will NOT be persisted")
+	}
+	if w.quarantineStore == nil {
+		log.Printf("[Worker] Warning: no quarantine store configured — permanently failed events will stay in Redis")
 	}
 
 	for {
@@ -344,18 +485,23 @@ func (w *Worker) processMessages(ctx context.Context, messages []buffer.RawMessa
 }
 
 // processSingleMessageIdempotent enforces at-most-once processing semantics on
-// top of Redis Streams' at-least-once delivery guarantee.
+// top of Redis Streams' at-least-once delivery guarantee, and turns the
+// pipeline outcome into an ACK/retry decision.
 //
 // Decision tree:
 //
 //  1. IsDone  → true:  already processed → skip side-effects, ACK
 //  2. TryClaimProcessing → false: another worker has the lock → skip without ACK
 //  3. TryClaimProcessing → true:  this worker owns the event
-//     a. ProcessSingleEvent → error: release lock, do NOT ACK (XAUTOCLAIM retries)
-//     b. ProcessSingleEvent → ok:   MarkDone, ACK
+//     a. OutcomeSuccess        → MarkDone, ACK
+//     b. OutcomeQuarantined    → quarantine, MarkDone, ACK (terminal: the
+//     event must not stay in Redis forever)
+//     c. OutcomeRetryableFailure → ReleaseProcessing, do NOT ACK
+//     (XAUTOCLAIM redelivers later; if the attempt counter has
+//     reached maxAttempts the event is quarantined instead)
 //
 // When idempotency is nil (test mode / opt-out), falls back to the simple
-// process+ACK path identical to the previous P0 behaviour.
+// process+ACK path.
 func (w *Worker) processSingleMessageIdempotent(ctx context.Context, msg buffer.RawMessage) {
 	eventID := msg.Event.EventID
 
@@ -367,7 +513,7 @@ func (w *Worker) processSingleMessageIdempotent(ctx context.Context, msg buffer.
 			log.Printf("[Worker] Warning: idempotency IsDone check failed for %s: %v (proceeding)", eventID, err)
 			// Degraded mode: continue without idempotency guarantees if Redis is unavailable.
 		} else if done {
-			log.Printf("[Worker] Event %s already processed, skipping duplicate (ACK)", eventID)
+			log.Printf("[Worker] event_id=%s outcome=skipped reason=already_processed (ACK)", eventID)
 			w.ack(ctx, msg)
 			return
 		}
@@ -383,35 +529,162 @@ func (w *Worker) processSingleMessageIdempotent(ctx context.Context, msg buffer.
 			// Another worker holds the processing lock.
 			// Do NOT ACK — message stays in this consumer's PEL and will be
 			// reclaimed by XAUTOCLAIM once the lock expires (after lockTTL).
-			log.Printf("[Worker] Event %s locked by another worker, skipping without ACK", eventID)
+			log.Printf("[Worker] event_id=%s outcome=deferred reason=locked_by_other_worker", eventID)
 			return
 		}
 	}
 
-	// ── Pipeline ─────────────────────────────────────────────────────────────
-	_, processErr := w.ProcessSingleEvent(ctx, msg.Event)
+	attempts := w.recordAttempt(ctx, eventID)
 
-	if processErr != nil {
-		log.Printf("[Worker] Error processing event %s (msg %s): %v", eventID, msg.ID, processErr)
-		if w.idempotency != nil {
-			// Release the processing lock so another worker can retry via XAUTOCLAIM.
-			if err := w.idempotency.ReleaseProcessing(ctx, eventID); err != nil {
-				log.Printf("[Worker] Warning: failed to release processing lock for %s: %v", eventID, err)
-			}
+	// ── Pipeline ─────────────────────────────────────────────────────────────
+	res, processErr := w.ProcessSingleEvent(ctx, msg.Event)
+	if res == nil {
+		// Defensive: ProcessSingleEvent always returns a result, but never
+		// discard an event that produced neither a result nor an outcome.
+		res = &PipelineResult{
+			EventID: eventID,
+			Outcome: OutcomeRetryableFailure,
+			Failure: failure.Classify(eventID, processErr),
 		}
-		// Do NOT ACK — message stays in PEL for XAUTOCLAIM-triggered retry.
+	}
+
+	// A result without a classification would panic on the log paths below;
+	// synthesise one rather than losing the event.
+	if res.Failure == nil && res.Outcome != OutcomeSuccess {
+		res.Failure = failure.Classify(eventID, processErr)
+	}
+
+	switch res.Outcome {
+	case OutcomeSuccess:
+		// MarkDone failure is non-fatal: the event was processed successfully
+		// even if the marker could not be recorded.
+		w.markDoneQuietly(ctx, eventID)
+		log.Printf("[Worker] event_id=%s stage=complete outcome=success format=%s action=%s net=%s duration_ms=%d",
+			eventID, formatOf(res), actionOf(res), netOf(res), res.Duration.Milliseconds())
+		w.ack(ctx, msg)
+
+	case OutcomeQuarantined:
+		if !w.writeQuarantine(ctx, msg, res, attempts, res.Failure) {
+			// The failure is permanent, but we could not record it. Keeping the
+			// message in Redis is the safe choice: the alternative silently
+			// discards the event.
+			log.Printf("[Worker] event_id=%s stage=%s outcome=quarantine_deferred reason=quarantine_write_failed",
+				eventID, stageOf(res))
+			w.releaseLock(ctx, eventID)
+			return
+		}
+
+		log.Printf("[Worker] event_id=%s stage=%s outcome=quarantined type=%s class=%s attempts=%d duration_ms=%d error=%q",
+			eventID, stageOf(res), res.Failure.TypeCode(), res.Failure.Class, attempts, res.Duration.Milliseconds(), res.Failure.Error())
+		w.markDoneQuietly(ctx, eventID)
+		w.ack(ctx, msg) // terminal: the event is safe in the quarantine store
+
+	case OutcomeRetryableFailure:
+		if w.maxAttempts > 0 && attempts >= w.maxAttempts {
+			escalated := res.Failure
+			if escalated == nil {
+				escalated = failure.Retryable(eventID, failure.StageUnknown, failure.TypeUnknown, processErr)
+			}
+			escalated = failure.Permanent(eventID, escalated.Stage, failure.TypeMaxAttempts, escalated.Err)
+
+			if w.writeQuarantine(ctx, msg, res, attempts, escalated) {
+				log.Printf("[Worker] event_id=%s stage=%s outcome=quarantined type=%s class=%s attempts=%d reason=max_attempts_exceeded error=%q",
+					eventID, escalated.Stage, escalated.Type, escalated.Class, attempts, escalated.Error())
+				w.markDoneQuietly(ctx, eventID)
+				w.ack(ctx, msg)
+				return
+			}
+
+			// The quarantine write itself failed; fall through and retry.
+			log.Printf("[Worker] event_id=%s stage=%s outcome=quarantine_deferred reason=quarantine_write_failed",
+				eventID, escalated.Stage)
+		}
+
+		log.Printf("[Worker] event_id=%s stage=%s outcome=retryable_failure type=%s attempts=%d duration_ms=%d error=%q",
+			eventID, stageOf(res), res.Failure.TypeCode(), attempts, res.Duration.Milliseconds(), res.Failure.Error())
+
+		// Release the processing lock so another worker can retry via XAUTOCLAIM,
+		// and do NOT ACK: the message stays in the PEL.
+		w.releaseLock(ctx, eventID)
+	}
+}
+
+// writeQuarantine records the event in the quarantine store. It reports whether
+// the entry was durably written; when it returns false the caller must not ACK.
+func (w *Worker) writeQuarantine(ctx context.Context, msg buffer.RawMessage, res *PipelineResult, attempts int64, f *failure.Error) bool {
+	if w.quarantineStore == nil {
+		log.Printf("[Worker] ERROR: event_id=%s cannot be quarantined: no quarantine store configured", msg.Event.EventID)
+		return false
+	}
+	if f == nil {
+		f = failure.Permanent(msg.Event.EventID, failure.StageUnknown, failure.TypeUnknown, nil)
+	}
+
+	eventID := msg.Event.EventID
+	if eventID == "" {
+		eventID = res.EventID
+	}
+
+	rawPayload := msg.Event
+	err := w.quarantineStore.Add(ctx, quarantine.Entry{
+		EventID:      eventID,
+		Stage:        string(f.Stage),
+		Type:         f.TypeCode(),
+		Class:        string(f.Class),
+		Message:      f.Error(),
+		Attempts:     attempts,
+		RawObjectKey: raw.ObjectKey(eventID),
+		RawFormat:    msg.Event.Format,
+		RawSource:    msg.Event.Source,
+		StreamID:     msg.ID,
+		ConsumerName: w.consumerName,
+		ReceivedAt:   parseReceivedAt(msg.Event.ReceivedAt),
+		RawPayload:   &rawPayload,
+	})
+	if err != nil {
+		log.Printf("[Worker] ERROR: failed to quarantine event %s (stream message %s): %v", eventID, msg.ID, err)
+		return false
+	}
+
+	return true
+}
+
+// recordAttempt increments the per-event attempt counter. It returns 0 when the
+// count is unavailable, which callers treat as "unknown" rather than as a
+// reason to stop processing.
+func (w *Worker) recordAttempt(ctx context.Context, eventID string) int64 {
+	if w.idempotency == nil {
+		return 0
+	}
+
+	attempts, err := w.idempotency.RecordAttempt(ctx, eventID, w.attemptTTL)
+	if err != nil {
+		log.Printf("[Worker] Warning: failed to record attempt for %s: %v", eventID, err)
+		return 0
+	}
+
+	return attempts
+}
+
+// releaseLock drops the processing lock so a retry can claim the event again.
+func (w *Worker) releaseLock(ctx context.Context, eventID string) {
+	if w.idempotency == nil {
 		return
 	}
-
-	// ── Mark done + ACK ──────────────────────────────────────────────────────
-	if w.idempotency != nil {
-		if err := w.idempotency.MarkDone(ctx, eventID, w.doneTTL); err != nil {
-			log.Printf("[Worker] Warning: failed to mark event %s as done: %v", eventID, err)
-			// ACK anyway — event was processed successfully even if we can't record it.
-		}
+	if err := w.idempotency.ReleaseProcessing(ctx, eventID); err != nil {
+		log.Printf("[Worker] Warning: failed to release processing lock for %s: %v", eventID, err)
 	}
+}
 
-	w.ack(ctx, msg)
+// markDoneQuietly records a terminal outcome (success or quarantine) so a
+// re-delivered event takes the IsDone fast path instead of being reprocessed.
+func (w *Worker) markDoneQuietly(ctx context.Context, eventID string) {
+	if w.idempotency == nil {
+		return
+	}
+	if err := w.idempotency.MarkDone(ctx, eventID, w.doneTTL); err != nil {
+		log.Printf("[Worker] Warning: failed to mark event %s as done: %v", eventID, err)
+	}
 }
 
 // ack sends XACK for msg, logging any error.
@@ -419,4 +692,45 @@ func (w *Worker) ack(ctx context.Context, msg buffer.RawMessage) {
 	if err := w.buffer.Ack(ctx, w.streamName, w.groupName, msg.ID); err != nil {
 		log.Printf("[Worker] Failed to ack message %s: %v", msg.ID, err)
 	}
+}
+
+// ── Logging helpers ──────────────────────────────────────────────────────────
+
+func stageOf(res *PipelineResult) string {
+	if res.Failure == nil {
+		return string(failure.StageUnknown)
+	}
+	return string(res.Failure.Stage)
+}
+
+func formatOf(res *PipelineResult) string {
+	if res.UniversalEvent == nil {
+		return "n/a"
+	}
+	return res.UniversalEvent.Raw.Format
+}
+
+func actionOf(res *PipelineResult) string {
+	if res.UniversalEvent == nil {
+		return "n/a"
+	}
+	return res.UniversalEvent.Event.Action
+}
+
+func netOf(res *PipelineResult) string {
+	if res.UniversalEvent == nil || res.UniversalEvent.Network == nil {
+		return "n/a"
+	}
+
+	net := res.UniversalEvent.Network
+	srcPort := 0
+	if net.SrcPort != nil {
+		srcPort = *net.SrcPort
+	}
+	dstPort := 0
+	if net.DstPort != nil {
+		dstPort = *net.DstPort
+	}
+
+	return fmt.Sprintf("%s:%d -> %s:%d (proto: %s)", net.SrcIP, srcPort, net.DstIP, dstPort, net.Protocol)
 }
