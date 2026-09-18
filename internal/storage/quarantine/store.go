@@ -59,6 +59,10 @@ type Entry struct {
 
 	// QuarantinedAt is when the event was first quarantined.
 	QuarantinedAt time.Time
+
+	// Provenance identifies the source, parser, mapping version and drift
+	// classification in force when the event failed.
+	Provenance models.Provenance
 }
 
 // Store persists quarantined events.

@@ -30,13 +30,17 @@ INSERT INTO normalized_events (
     source_type, source_vendor, source_product, source_identifier,
     event_category, event_action, event_severity,
     src_ip, src_port, dst_ip, dst_port, protocol, username,
-    raw_format, raw_object_key, parser_version, ingested_at, payload
+    raw_format, raw_object_key, parser_version, ingested_at,
+    source_fingerprint, parser_id, mapping_id, mapping_version, drift_status,
+    payload
 ) VALUES (
     $1, $2, $3, $4,
     $5, $6, $7, $8,
     $9, $10, $11,
     $12, $13, $14, $15, $16, $17,
-    $18, $19, $20, $21, $22::jsonb
+    $18, $19, $20, $21,
+    $22, $23, $24, $25, $26,
+    $27::jsonb
 )
 ON CONFLICT (event_id) DO NOTHING`
 
@@ -80,6 +84,18 @@ func (p *PostgresStore) Save(ctx context.Context, rec Record) (bool, error) {
 		receivedAt = rec.ReceivedAt.UTC()
 	}
 
+	var mappingVersion any
+	if rec.Provenance.MappingVersion > 0 {
+		mappingVersion = rec.Provenance.MappingVersion
+	}
+
+	// The event's own metadata carries the same provenance; fall back to it so
+	// callers that only populated the event still store a parser version.
+	parserVersion := rec.Provenance.ParserVersion
+	if parserVersion == "" {
+		parserVersion = evt.Metadata.ParserVersion
+	}
+
 	res, err := p.db.ExecContext(ctx, insertEventSQL,
 		evt.EventID,
 		evt.SchemaVersion,
@@ -100,8 +116,13 @@ func (p *PostgresStore) Save(ctx context.Context, rec Record) (bool, error) {
 		username,
 		evt.Raw.Format,
 		rec.RawObjectKey,
-		nullable(evt.Metadata.ParserVersion),
+		nullable(parserVersion),
 		postgres.TimestampOrNil(evt.Metadata.IngestedAt),
+		nullable(rec.Provenance.SourceFingerprint),
+		nullable(rec.Provenance.ParserID),
+		nullable(rec.Provenance.MappingID),
+		mappingVersion,
+		nullable(rec.Provenance.DriftStatus),
 		string(payload),
 	)
 	if err != nil {
@@ -117,20 +138,28 @@ func (p *PostgresStore) Save(ctx context.Context, rec Record) (bool, error) {
 }
 
 const selectEventSQL = `
-SELECT payload, raw_object_key, received_at
+SELECT payload, raw_object_key, received_at,
+       parser_version, source_fingerprint, parser_id, mapping_id, mapping_version, drift_status
 FROM normalized_events
 WHERE event_id = $1`
 
 // Get returns the stored record for eventID.
 func (p *PostgresStore) Get(ctx context.Context, eventID string) (*Record, error) {
 	var (
-		payload      []byte
-		rawObjectKey string
-		receivedAt   sql.NullTime
+		payload       []byte
+		rawObjectKey  string
+		receivedAt    sql.NullTime
+		parserVersion sql.NullString
+		fingerprint   sql.NullString
+		parserID      sql.NullString
+		mappingID     sql.NullString
+		mappingVer    sql.NullInt64
+		driftStatus   sql.NullString
 	)
 
 	err := p.db.QueryRowContext(ctx, selectEventSQL, eventID).
-		Scan(&payload, &rawObjectKey, &receivedAt)
+		Scan(&payload, &rawObjectKey, &receivedAt,
+			&parserVersion, &fingerprint, &parserID, &mappingID, &mappingVer, &driftStatus)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("normalized event %s not found", eventID)
 	}
@@ -143,7 +172,18 @@ func (p *PostgresStore) Get(ctx context.Context, eventID string) (*Record, error
 		return nil, fmt.Errorf("failed to unmarshal stored event %s: %w", eventID, err)
 	}
 
-	rec := &Record{Event: &evt, RawObjectKey: rawObjectKey}
+	rec := &Record{
+		Event:        &evt,
+		RawObjectKey: rawObjectKey,
+		Provenance: models.Provenance{
+			SourceFingerprint: fingerprint.String,
+			ParserID:          parserID.String,
+			ParserVersion:     parserVersion.String,
+			MappingID:         mappingID.String,
+			MappingVersion:    int(mappingVer.Int64),
+			DriftStatus:       driftStatus.String,
+		},
+	}
 	if receivedAt.Valid {
 		rec.ReceivedAt = receivedAt.Time
 	}

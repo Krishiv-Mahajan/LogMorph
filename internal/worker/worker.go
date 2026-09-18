@@ -11,10 +11,12 @@ import (
 
 	"github.com/Krishiv-Mahajan/LogMorph/internal/buffer"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/detection"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/drift"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/failure"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/models"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/normalization"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/parsing"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/registry"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/normalized"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/quarantine"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/raw"
@@ -46,7 +48,6 @@ type PipelineResult struct {
 	UniversalEvent *models.UniversalEvent
 	Valid          bool
 	Errors         []validation.ValidationError
-	Drift          models.DriftResult
 
 	// Outcome is the explicit processing outcome (see Outcome constants).
 	Outcome Outcome
@@ -57,6 +58,19 @@ type PipelineResult struct {
 
 	// Duration is the wall-clock time spent processing the event.
 	Duration time.Duration
+
+	// SchemaDrift is the single authoritative drift verdict for this event.
+	// Nil when no drift analyzer is configured.
+	SchemaDrift *drift.Result
+
+	// Mapping is the parser/mapping version applied to this event.
+	Mapping *registry.Entry
+
+	// Bindings records the values the alias binder contributed.
+	Bindings []drift.Binding
+
+	// Provenance is the traceability block written to the event and its row.
+	Provenance models.Provenance
 }
 
 // Worker coordinates raw event consumption, immutable storage, and the processing pipeline.
@@ -65,12 +79,12 @@ type Worker struct {
 	idempotency     buffer.IdempotencyStore
 	rawStore        raw.RawEventStore
 	detector        detection.Detector
-	driftDetector   detection.DriftDetector
 	parserEngine    parsing.Engine
 	normalizer      *normalization.Normalizer
 	validator       validation.Validator
 	normalizedStore normalized.Store
 	quarantineStore quarantine.Store
+	driftAnalyzer   drift.Analyzer
 
 	streamName   string
 	groupName    string
@@ -149,6 +163,11 @@ type Config struct {
 	// permanent failures cannot be recorded and are left in Redis rather than
 	// being discarded.
 	QuarantineStore quarantine.Store
+
+	// DriftAnalyzer performs registry-backed schema drift analysis. When nil,
+	// the worker keeps the pre-registry behaviour: events are parsed from the
+	// detected format and no provenance is recorded.
+	DriftAnalyzer drift.Analyzer
 }
 
 const (
@@ -169,7 +188,6 @@ func NewWorker(
 	idempotency buffer.IdempotencyStore,
 	rawStore raw.RawEventStore,
 	detector detection.Detector,
-	driftDetector detection.DriftDetector,
 	parserEngine parsing.Engine,
 	normalizer *normalization.Normalizer,
 	validator validation.Validator,
@@ -208,12 +226,12 @@ func NewWorker(
 		idempotency:     idempotency,
 		rawStore:        rawStore,
 		detector:        detector,
-		driftDetector:   driftDetector,
 		parserEngine:    parserEngine,
 		normalizer:      normalizer,
 		validator:       validator,
 		normalizedStore: cfg.NormalizedStore,
 		quarantineStore: cfg.QuarantineStore,
+		driftAnalyzer:   cfg.DriftAnalyzer,
 		streamName:      cfg.StreamName,
 		groupName:       cfg.GroupName,
 		consumerName:    cfg.ConsumerName,
@@ -261,23 +279,40 @@ func (w *Worker) ProcessSingleEvent(ctx context.Context, rawEvent models.RawEven
 	// 2. Format / Source Detection
 	detectionRes := w.detector.Detect(rawEvent.Payload, rawEvent.Format)
 
-	// 3. Drift Analysis
-	driftRes, err := w.driftDetector.Analyze(ctx, rawEvent, detectionRes)
-	if err != nil {
-		log.Printf("[Worker] event_id=%s stage=drift outcome=degraded error=%q", rawEvent.EventID, err)
+	// 3. Schema Drift Analysis + Source Registry resolution.
+	//
+	// This is the ONLY place a drift verdict is produced. Downstream stages
+	// (parser selection, alias binding, provenance, quarantine and logging)
+	// consume res.SchemaDrift and nothing else; no second drift computation
+	// runs in this pipeline.
+	//
+	// It also decides which parser and mapping version own this source, and
+	// records provenance for the stored event.
+	schemaDrift := w.analyzeSchemaDrift(ctx, rawEvent, detectionRes)
+	res.SchemaDrift = schemaDrift
+	if schemaDrift != nil && schemaDrift.Entry != nil {
+		res.Mapping = schemaDrift.Entry
 	}
-	if driftRes.Status == models.DriftStatusUnknown || driftRes.Status == models.DriftStatusMajorDrift {
-		log.Printf("[Worker] event_id=%s stage=drift outcome=alert status=%s reason=%q",
-			rawEvent.EventID, driftRes.Status, driftRes.Message)
-	}
-	res.Drift = driftRes
+	// Provenance is captured before parsing so a parse or validation failure
+	// still records which parser and mapping version was in force.
+	res.Provenance = w.provenanceOf(res)
 
 	// 4. Parser Engine
 	// Deterministic: the same payload will fail the same way on every attempt,
 	// so a parse failure is permanent rather than retryable.
-	parsedEvent, err := w.parserEngine.Parse(ctx, rawEvent, detectionRes)
+	parserID := ""
+	if res.Mapping != nil {
+		parserID = res.Mapping.ParserID
+	}
+	parsedEvent, err := w.parserEngine.ParseWith(ctx, rawEvent, detectionRes, parserID)
 	if err != nil {
 		return w.failed(res, classifyParseFailure(rawEvent.EventID, err), started)
+	}
+
+	// 4b. Alias binding: apply declared aliases the parser does not implement
+	// itself. The parser's own values always win.
+	if schemaDrift != nil && schemaDrift.Entry != nil && len(schemaDrift.Observation.Fields) > 0 {
+		res.Bindings = drift.Bind(parsedEvent, schemaDrift.Observation, schemaDrift.Entry.Contract)
 	}
 
 	// 5. Normalization
@@ -289,6 +324,10 @@ func (w *Worker) ProcessSingleEvent(ctx context.Context, rawEvent models.RawEven
 	}
 	res.UniversalEvent = universalEvent
 	res.EventID = universalEvent.EventID
+
+	// 5b. Record the provenance on the event itself, so the stored payload is
+	// self-describing even without the database columns.
+	res.Provenance.Apply(&universalEvent.Metadata)
 
 	// 6. JSON Schema Validation
 	valResult := w.validator.Validate(universalEvent)
@@ -306,6 +345,7 @@ func (w *Worker) ProcessSingleEvent(ctx context.Context, rawEvent models.RawEven
 			Event:        universalEvent,
 			RawObjectKey: raw.ObjectKey(universalEvent.EventID),
 			ReceivedAt:   parseReceivedAt(rawEvent.ReceivedAt),
+			Provenance:   res.Provenance,
 		})
 		if err != nil {
 			return w.failed(res, failure.Retryable(universalEvent.EventID, failure.StagePersistence,
@@ -316,6 +356,56 @@ func (w *Worker) ProcessSingleEvent(ctx context.Context, rawEvent models.RawEven
 	res.Duration = time.Since(started)
 
 	return res, nil
+}
+
+// analyzeSchemaDrift resolves the source's parser/mapping and produces the
+// event's single drift verdict.
+//
+// A registry failure is treated as non-fatal: the registry carries metadata and
+// versioning, and losing that metadata is preferable to failing an event that
+// could still be parsed and stored. The caller falls back to format-based
+// parser selection when the result is nil.
+//
+// The escalation alert is emitted here, from the authoritative verdict, so it
+// covers every outcome — including events that go on to fail parsing or
+// validation, which is exactly when an operator needs the drift signal.
+func (w *Worker) analyzeSchemaDrift(ctx context.Context, rawEvent models.RawEvent, detectionRes models.DetectionResult) *drift.Result {
+	if w.driftAnalyzer == nil {
+		return nil
+	}
+
+	result, err := w.driftAnalyzer.Analyze(ctx, rawEvent, detectionRes)
+	if err != nil {
+		log.Printf("[Worker] event_id=%s stage=drift outcome=degraded error=%q", rawEvent.EventID, err)
+		return nil
+	}
+
+	// EscalationRequired covers both major_drift and unknown: the event cannot
+	// be mapped deterministically and needs review.
+	if result.EscalationRequired {
+		log.Printf("[Worker] event_id=%s stage=drift outcome=alert status=%s reason=%q",
+			rawEvent.EventID, result.Classification, result.Reason)
+	}
+
+	return result
+}
+
+// provenanceOf builds the traceability block for an event.
+func (w *Worker) provenanceOf(res *PipelineResult) models.Provenance {
+	provenance := models.Provenance{}
+
+	if res.Mapping != nil {
+		provenance.SourceFingerprint = res.Mapping.Fingerprint
+		provenance.ParserID = res.Mapping.ParserID
+		provenance.ParserVersion = res.Mapping.ParserVersion
+		provenance.MappingID = res.Mapping.MappingID
+		provenance.MappingVersion = res.Mapping.MappingVersion
+	}
+	if res.SchemaDrift != nil {
+		provenance.DriftStatus = string(res.SchemaDrift.Classification)
+	}
+
+	return provenance
 }
 
 // failed records a classified failure on the result and returns it together
@@ -559,8 +649,8 @@ func (w *Worker) processSingleMessageIdempotent(ctx context.Context, msg buffer.
 		// MarkDone failure is non-fatal: the event was processed successfully
 		// even if the marker could not be recorded.
 		w.markDoneQuietly(ctx, eventID)
-		log.Printf("[Worker] event_id=%s stage=complete outcome=success format=%s action=%s net=%s duration_ms=%d",
-			eventID, formatOf(res), actionOf(res), netOf(res), res.Duration.Milliseconds())
+		log.Printf("[Worker] event_id=%s stage=complete outcome=success format=%s action=%s net=%s mapping=%s drift=%s duration_ms=%d",
+			eventID, formatOf(res), actionOf(res), netOf(res), mappingOf(res), driftOf(res), res.Duration.Milliseconds())
 		w.ack(ctx, msg)
 
 	case OutcomeQuarantined:
@@ -640,6 +730,7 @@ func (w *Worker) writeQuarantine(ctx context.Context, msg buffer.RawMessage, res
 		ConsumerName: w.consumerName,
 		ReceivedAt:   parseReceivedAt(msg.Event.ReceivedAt),
 		RawPayload:   &rawPayload,
+		Provenance:   res.Provenance,
 	})
 	if err != nil {
 		log.Printf("[Worker] ERROR: failed to quarantine event %s (stream message %s): %v", eventID, msg.ID, err)
@@ -715,6 +806,32 @@ func actionOf(res *PipelineResult) string {
 		return "n/a"
 	}
 	return res.UniversalEvent.Event.Action
+}
+
+// mappingOf renders the parser/mapping version that processed an event.
+func mappingOf(res *PipelineResult) string {
+	if res.Mapping == nil {
+		return "none"
+	}
+	return fmt.Sprintf("%s/v%d", res.Mapping.MappingID, res.Mapping.MappingVersion)
+}
+
+// driftOf renders the drift classification, noting when the mapping was
+// adapted by this very event.
+func driftOf(res *PipelineResult) string {
+	if res.SchemaDrift == nil {
+		return "unanalyzed"
+	}
+
+	status := string(res.SchemaDrift.Classification)
+	if res.SchemaDrift.Adapted && res.Mapping != nil {
+		status = fmt.Sprintf("%s(adapted=v%d)", status, res.Mapping.MappingVersion)
+	}
+	if res.SchemaDrift.EscalationRequired {
+		status += "(review_required)"
+	}
+
+	return status
 }
 
 func netOf(res *PipelineResult) string {

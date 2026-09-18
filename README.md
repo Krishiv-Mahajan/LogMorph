@@ -106,14 +106,48 @@ All 100 events remain accounted for. Invalid events are not necessarily sent to 
 * **Processing Worker**: Go workers consume raw events, coordinate the pipeline, and preserve the immutable raw copy.
 * **Immutable Raw Event Store**: MinIO/S3 stores the original raw event unmodified for audit, replay, forensics, debugging, and reprocessing.
 * **Format / Source Detection**: Identifies event structure/source (currently supporting Syslog, JSON, CSV).
-* **Schema Drift Analysis**: Detects changes in the event structure deterministically.
-* **Parser Registry**: Manages available parsers (currently an in-memory registry, planned for PostgreSQL backing).
+* **Schema Drift Analysis**: Compares an incoming payload against the contract the source registry holds for that source, and classifies the difference.
+* **Source Registry**: Maps a source fingerprint to the parser and mapping version that owns it, with an append-only version chain in PostgreSQL.
+* **Parser Registry**: Manages available parsers and their declared field contracts.
 * **Parser Engine**: Format-specific parsers built on a common Go interface.
 * **Normalization**: Maps parsed data to the canonical Universal Event Schema.
 * **Validation**: Enforces strict JSON Schema Validation against the normalized event.
 * **Normalized Store**: PostgreSQL store for successfully processed, analytics-ready events.
 * **Quarantine Store**: PostgreSQL store for failed/unparsed events and error tracking.
 * **Output Connectors (Planned)**: Feeds SIEM, Data Lakes, and ML pipelines.
+
+### Source Registry & Minor Drift
+
+Every event is resolved to a **source fingerprint** built from transport
+identity (format + source hint + source type). Critically, the fingerprint is
+derived *before* parsing and never from field names, so a source that changes
+its schema is still recognised as the same source drifting.
+
+The registry holds an append-only chain of **mapping versions** per source. The
+first event from a source records the contract its parser declares as v1.
+
+When a payload differs from the active contract, the drift engine classifies the
+difference:
+
+| Change | Verdict | Action |
+| :--- | :--- | :--- |
+| Extra scalar field | `minor_drift` | Recorded as an optional, unbound field; new mapping version |
+| Declared alias used as a synonym | `stable` | No version change; the contract already covers it |
+| Optional field absent | `stable` | Absence of an optional field is not drift |
+| Required field absent | `major_drift` | **Not** adapted; escalated |
+| Incompatible type change | `major_drift` | **Not** adapted; escalated |
+| New nested structure | `major_drift` | **Not** adapted; escalated |
+| Two names, one target, different values | `major_drift` | **Not** adapted; escalated |
+
+Auto-adaptation is deliberately asymmetric: adding a field cannot change the
+meaning of fields already mapped, so it is safe to record. Anything that could
+change meaning is escalated instead — an escalated event is still parsed with the
+last known-good mapping, so it is never dropped, but its `drift_status` records
+that the source needs review. No AI or human review step is implemented yet.
+
+Aliases are declared in the contract and applied after parsing by the alias
+binder, which only fills attributes the parser left empty and never binds a
+field whose meaning is not declared.
 
 ### Failure Classification & Retry Semantics
 
@@ -137,6 +171,22 @@ Persistence is idempotent at the database level (`PRIMARY KEY (event_id)` with
 `ON CONFLICT DO NOTHING`), so a retried or re-delivered event cannot create a
 second normalized row. Duplicate-suppression is independent of the Redis
 done-marker, so it holds across restarts and after the marker expires.
+
+### Provenance
+
+Every stored event carries the chain that produced it:
+
+```
+raw object (MinIO)  ->  event_id  ->  parser_id + parser_version
+                                  ->  mapping_id + mapping_version
+                                  ->  source_fingerprint + drift_status
+```
+
+The provenance is written both into the event's `metadata` block and into
+columns on `normalized_events` / `quarantined_events`, so stored events join
+directly to `source_registry`. Because mapping versions are append-only and
+superseded rather than edited, an event processed under v1 remains explainable
+after the source has moved to v3.
 
 ## Universal Event Schema
 
@@ -181,12 +231,16 @@ Below is an overview of the required fields in `contracts/universal_event.schema
 ├── contracts/        # JSON Schemas (universal_event, raw_event, worker_event)
 ├── internal/
 │   ├── buffer/       # Redis Stream implementation
-│   ├── detection/    # Format/Source detection & drift
+│   ├── contract/     # Declarative field contracts (the "mapping" model)
+│   ├── detection/    # Format/Source detection & format-level drift
+│   ├── drift/        # Schema observation, drift classification, alias binding
 │   ├── failure/      # Error classification (permanent vs retryable)
 │   ├── ingestion/    # Ingestion service/handlers
 │   ├── models/       # Shared struct definitions
 │   ├── normalization/# Mapping logic to Universal Schema
-│   ├── parsing/      # Engine, Registry, and Parsers (syslog, json, csv)
+│   ├── parsing/      # Engine, parser registry, and parsers (syslog, json, csv)
+│   │   └── parsers/  #   Parser implementations + declared contracts
+│   ├── registry/     # Source registry: fingerprint -> parser/mapping versions
 │   ├── storage/      # Storage adapters
 │   │   ├── normalized/#   PostgreSQL normalized event store (+ memory)
 │   │   ├── postgres/  #    Connection pool & embedded migrations

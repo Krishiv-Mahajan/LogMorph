@@ -118,7 +118,6 @@ func TestFullTargetArchitecture_E2E(t *testing.T) {
 
 	// Worker Setup
 	detector := detection.NewDetector()
-	driftDetector := detection.NewDriftDetector()
 	registry := parsing.NewRegistry()
 	registry.Register(parsers.NewSyslogParser())
 	registry.Register(parsers.NewJSONParser())
@@ -135,7 +134,6 @@ func TestFullTargetArchitecture_E2E(t *testing.T) {
 		buffer.NewMemoryIdempotencyStore(),
 		rawStore,
 		detector,
-		driftDetector,
 		parserEngine,
 		normalizer,
 		validator,
@@ -304,7 +302,6 @@ func buildPipeline(t *testing.T) (*ingestion.Handler, *inMemoryBuffer, *worker.W
 		idempotency,
 		rawStore,
 		detection.NewDetector(),
-		detection.NewDriftDetector(),
 		parsing.NewEngine(registry),
 		normalization.NewNormalizer(),
 		validator,
@@ -485,7 +482,7 @@ func TestDuplicateDeliveryPath_E2E(t *testing.T) {
 	}
 	w2 := worker.NewWorker(
 		rawBuf2, buffer.NewMemoryIdempotencyStore(), raw.NewMemoryRawStore(),
-		detection.NewDetector(), detection.NewDriftDetector(),
+		detection.NewDetector(),
 		parsing.NewEngine(registry), normalization.NewNormalizer(), validator,
 		worker.Config{
 			StreamName:      "raw_events",

@@ -23,6 +23,10 @@ type Record struct {
 
 	// ReceivedAt is when ingestion accepted the raw event. Zero when unknown.
 	ReceivedAt time.Time
+
+	// Provenance identifies the source, parser and mapping version that
+	// produced this event.
+	Provenance models.Provenance
 }
 
 // Store persists normalized UniversalEvents.

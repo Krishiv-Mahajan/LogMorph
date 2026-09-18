@@ -27,11 +27,13 @@ const insertEntrySQL = `
 INSERT INTO quarantined_events (
     event_id, failure_stage, failure_type, failure_class, error_message,
     attempts, raw_object_key, raw_format, raw_source, stream_id, consumer_name,
-    received_at, raw_payload
+    received_at, source_fingerprint, parser_id, mapping_id, mapping_version, drift_status,
+    raw_payload
 ) VALUES (
     $1, $2, $3, $4, $5,
     $6, $7, $8, $9, $10, $11,
-    $12, $13::jsonb
+    $12, $13, $14, $15, $16, $17,
+    $18::jsonb
 )
 ON CONFLICT (event_id) DO UPDATE SET
     failure_stage  = EXCLUDED.failure_stage,
@@ -44,6 +46,11 @@ ON CONFLICT (event_id) DO UPDATE SET
     raw_source     = EXCLUDED.raw_source,
     stream_id      = EXCLUDED.stream_id,
     consumer_name  = EXCLUDED.consumer_name,
+    source_fingerprint = EXCLUDED.source_fingerprint,
+    parser_id          = EXCLUDED.parser_id,
+    mapping_id         = EXCLUDED.mapping_id,
+    mapping_version    = EXCLUDED.mapping_version,
+    drift_status       = EXCLUDED.drift_status,
     raw_payload    = EXCLUDED.raw_payload,
     last_seen_at   = now()`
 
@@ -72,6 +79,11 @@ func (p *PostgresStore) Add(ctx context.Context, entry Entry) error {
 		rawPayload = string(data)
 	}
 
+	var mappingVersion any
+	if entry.Provenance.MappingVersion > 0 {
+		mappingVersion = entry.Provenance.MappingVersion
+	}
+
 	_, err := p.db.ExecContext(ctx, insertEntrySQL,
 		entry.EventID,
 		entry.Stage,
@@ -85,6 +97,11 @@ func (p *PostgresStore) Add(ctx context.Context, entry Entry) error {
 		nullable(entry.StreamID),
 		nullable(entry.ConsumerName),
 		receivedAt,
+		nullable(entry.Provenance.SourceFingerprint),
+		nullable(entry.Provenance.ParserID),
+		nullable(entry.Provenance.MappingID),
+		mappingVersion,
+		nullable(entry.Provenance.DriftStatus),
 		rawPayload,
 	)
 	if err != nil {
@@ -97,7 +114,8 @@ func (p *PostgresStore) Add(ctx context.Context, entry Entry) error {
 const selectEntrySQL = `
 SELECT event_id, failure_stage, failure_type, failure_class, error_message,
        attempts, raw_object_key, raw_format, raw_source, stream_id, consumer_name,
-       received_at, raw_payload, quarantined_at
+       received_at, source_fingerprint, parser_id, mapping_id, mapping_version, drift_status,
+       raw_payload, quarantined_at
 FROM quarantined_events
 WHERE event_id = $1`
 
@@ -111,6 +129,11 @@ func (p *PostgresStore) Get(ctx context.Context, eventID string) (*Entry, error)
 		streamID     sql.NullString
 		consumerName sql.NullString
 		receivedAt   sql.NullTime
+		fingerprint  sql.NullString
+		parserID     sql.NullString
+		mappingID    sql.NullString
+		mappingVer   sql.NullInt64
+		driftStatus  sql.NullString
 		rawPayload   []byte
 	)
 
@@ -127,6 +150,11 @@ func (p *PostgresStore) Get(ctx context.Context, eventID string) (*Entry, error)
 		&streamID,
 		&consumerName,
 		&receivedAt,
+		&fingerprint,
+		&parserID,
+		&mappingID,
+		&mappingVer,
+		&driftStatus,
 		&rawPayload,
 		&entry.QuarantinedAt,
 	)
@@ -142,6 +170,13 @@ func (p *PostgresStore) Get(ctx context.Context, eventID string) (*Entry, error)
 	entry.RawSource = rawSource.String
 	entry.StreamID = streamID.String
 	entry.ConsumerName = consumerName.String
+	entry.Provenance = models.Provenance{
+		SourceFingerprint: fingerprint.String,
+		ParserID:          parserID.String,
+		MappingID:         mappingID.String,
+		MappingVersion:    int(mappingVer.Int64),
+		DriftStatus:       driftStatus.String,
+	}
 	if receivedAt.Valid {
 		entry.ReceivedAt = receivedAt.Time
 	}

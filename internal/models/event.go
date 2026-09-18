@@ -71,9 +71,28 @@ type RawInfo struct {
 }
 
 // MetadataInfo tracks parsing and processing lineage.
+//
+// The provenance block (fingerprint, parser id, mapping id/version, drift
+// status) is what makes a stored event explainable after the registry has moved
+// on: it names the exact parser and mapping version that produced the event, so
+// a later registry change cannot rewrite history. The fields are optional and
+// additive, so existing consumers and the v1.0 schema keep working.
 type MetadataInfo struct {
 	ParserVersion string `json:"parser_version"`
 	IngestedAt    string `json:"ingested_at"`
+
+	// SourceFingerprint identifies the log source this event came from.
+	SourceFingerprint string `json:"source_fingerprint,omitempty"`
+
+	// ParserID identifies the parser that consumed the event.
+	ParserID string `json:"parser_id,omitempty"`
+
+	// MappingID / MappingVersion identify the field contract that was applied.
+	MappingID      string `json:"mapping_id,omitempty"`
+	MappingVersion int    `json:"mapping_version,omitempty"`
+
+	// DriftStatus is the drift classification observed for this event.
+	DriftStatus string `json:"drift_status,omitempty"`
 }
 
 // ParsedEvent represents the structured domain fields extracted by a format parser.

@@ -75,7 +75,29 @@
       "required": ["parser_version", "ingested_at"],
       "properties": {
         "parser_version": { "type": "string" },
-        "ingested_at": { "type": "string" }
+        "ingested_at": { "type": "string" },
+        "source_fingerprint": {
+          "type": "string",
+          "description": "Stable identifier of the log source this event came from."
+        },
+        "parser_id": {
+          "type": "string",
+          "description": "Identifier of the parser that consumed the event."
+        },
+        "mapping_id": {
+          "type": "string",
+          "description": "Field contract applied to the event, stable across versions."
+        },
+        "mapping_version": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Version of the field contract applied to the event."
+        },
+        "drift_status": {
+          "type": "string",
+          "enum": ["stable", "minor_drift", "major_drift", "unknown"],
+          "description": "Drift classification observed while processing the event."
+        }
       },
       "additionalProperties": true
     }

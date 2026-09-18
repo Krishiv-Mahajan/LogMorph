@@ -26,7 +26,6 @@ type Stage string
 const (
 	StageRawStore      Stage = "raw_store"
 	StageDetection     Stage = "detection"
-	StageDrift         Stage = "drift"
 	StageParsing       Stage = "parsing"
 	StageNormalization Stage = "normalization"
 	StageValidation    Stage = "validation"

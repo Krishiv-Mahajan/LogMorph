@@ -11,9 +11,11 @@ import (
 
 	"github.com/Krishiv-Mahajan/LogMorph/internal/buffer"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/detection"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/drift"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/normalization"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/parsing"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/parsing/parsers"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/registry"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/normalized"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/postgres"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/quarantine"
@@ -165,16 +167,27 @@ func main() {
 	normalizedStore := normalized.NewPostgresStore(pgDB)
 	quarantineStore := quarantine.NewPostgresStore(pgDB)
 
-	// 4. Detection & Drift
+	// 4. Detection
 	detector := detection.NewDetector()
-	driftDetector := detection.NewDriftDetector()
 
-	// 5. Parser Engine & Registry
-	registry := parsing.NewRegistry()
-	registry.Register(parsers.NewSyslogParser())
-	registry.Register(parsers.NewJSONParser())
-	registry.Register(parsers.NewCSVParser())
-	parserEngine := parsing.NewEngine(registry)
+	// 5. Parser Engine & Parser Registry
+	parserRegistry := parsing.NewRegistry()
+	parserRegistry.Register(parsers.NewSyslogParser())
+	parserRegistry.Register(parsers.NewJSONParser())
+	parserRegistry.Register(parsers.NewCSVParser())
+	parserEngine := parsing.NewEngine(parserRegistry)
+
+	// 5b. Source Registry & Drift Engine
+	//
+	// The source registry resolves a fingerprint to the parser/mapping version
+	// that owns it, and versions the field contract when a source drifts.
+	registryStore := registry.NewPostgresStore(pgDB)
+	driftEngine := drift.NewEngine(registryStore, parserRegistry)
+
+	for _, descriptor := range parserRegistry.Descriptors() {
+		log.Printf("[Worker] Parser contract: id=%s version=%s mapping=%s fields=%d",
+			descriptor.ParserID, descriptor.ParserVersion, descriptor.MappingID, len(descriptor.Contract.Fields))
+	}
 
 	// 6. Normalizer
 	normalizer := normalization.NewNormalizer()
@@ -191,7 +204,6 @@ func main() {
 		idempotencyStore,
 		rawStore,
 		detector,
-		driftDetector,
 		parserEngine,
 		normalizer,
 		validator,
@@ -208,6 +220,7 @@ func main() {
 			Concurrency:       concurrency,
 			NormalizedStore:   normalizedStore,
 			QuarantineStore:   quarantineStore,
+			DriftAnalyzer:     driftEngine,
 		},
 	)
 
