@@ -13,6 +13,7 @@ import (
 	"github.com/Krishiv-Mahajan/LogMorph/internal/normalization"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/parsing"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/parsing/parsers"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/quarantine"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/raw"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/validation"
 )
@@ -150,6 +151,7 @@ func setupTestWorkerWithIdempotency(
 		mockBuf,
 		idempotency,
 		rawStore,
+		quarantine.NewMemoryQuarantineStore(),
 		detection.NewDetector(),
 		detection.NewDriftDetector(),
 		buildParserEngine(),
@@ -237,6 +239,7 @@ func TestWorker_ClaimsPendingOnRecovery(t *testing.T) {
 		mockBuf,
 		buffer.NewMemoryIdempotencyStore(),
 		rawStore,
+		quarantine.NewMemoryQuarantineStore(),
 		detection.NewDetector(),
 		detection.NewDriftDetector(),
 		buildParserEngine(),
@@ -379,69 +382,6 @@ func TestIdempotency_LockConflictSkipsWithoutACK(t *testing.T) {
 	}
 }
 
-// TestIdempotency_FailureReleasesLockAndNoACK — when processing fails (no
-// parser registered), the processing lock is released and the message is
-// NOT ACKed so XAUTOCLAIM can retry.
-func TestIdempotency_FailureReleasesLockAndNoACK(t *testing.T) {
-	msg := buffer.RawMessage{
-		ID: "msg-4",
-		Event: models.RawEvent{
-			EventID:    "evt_fail",
-			ReceivedAt: time.Now().UTC().Format(time.RFC3339),
-			Format:     "unknown_format", // no parser registered → engine returns error
-			Source:     "test",
-			Payload:    "some raw log data",
-		},
-	}
-
-	mockBuf := &mockWorkerBuffer{messages: []buffer.RawMessage{msg}}
-	idempotency := newMockIdempotencyStore()
-	rawStore := raw.NewMemoryRawStore()
-
-	normalizer := normalization.NewNormalizer()
-	validator, err := validation.NewValidator("")
-	if err != nil {
-		t.Fatalf("setup: %v", err)
-	}
-
-	// Intentionally empty registry — no parser for "unknown_format".
-	emptyRegistry := parsing.NewRegistry()
-	emptyEngine := parsing.NewEngine(emptyRegistry)
-
-	w := NewWorker(
-		mockBuf,
-		idempotency,
-		rawStore,
-		detection.NewDetector(),
-		detection.NewDriftDetector(),
-		emptyEngine,
-		normalizer,
-		validator,
-		Config{
-			StreamName:   "raw_events",
-			GroupName:    "test-group",
-			ConsumerName: "test-worker",
-		},
-	)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-	_ = w.Start(ctx)
-
-	// Must NOT ACK — message should remain in PEL for retry.
-	if len(mockBuf.acked) != 0 {
-		t.Errorf("expected NO ACK on processing failure, got %v", mockBuf.acked)
-	}
-	// Processing lock must be released so another worker can retry.
-	if len(idempotency.releasedKeys) == 0 || idempotency.releasedKeys[0] != "evt_fail" {
-		t.Errorf("expected ReleaseProcessing called with evt_fail, got %v", idempotency.releasedKeys)
-	}
-	// MarkDone must NOT be called on failure.
-	if len(idempotency.markedDoneKeys) != 0 {
-		t.Errorf("expected MarkDone NOT called on failure, got %v", idempotency.markedDoneKeys)
-	}
-}
-
 // TestIdempotency_SuccessfulProcessingPreventsReprocessing — after the first
 // successful processing (MarkDone), a second delivery of the same event is
 // skipped.
@@ -547,6 +487,7 @@ func TestWorker_ConcurrentBatchProcessing(t *testing.T) {
 		mockBuf,
 		idempotency,
 		rawStore,
+		quarantine.NewMemoryQuarantineStore(),
 		detection.NewDetector(),
 		detection.NewDriftDetector(),
 		buildParserEngine(),
@@ -617,6 +558,7 @@ func TestWorker_PartialFailureInBatch(t *testing.T) {
 		mockBuf,
 		idempotency,
 		rawStore,
+		quarantine.NewMemoryQuarantineStore(),
 		detection.NewDetector(),
 		detection.NewDriftDetector(),
 		buildParserEngine(),
@@ -648,8 +590,8 @@ func TestWorker_PartialFailureInBatch(t *testing.T) {
 	if !ackedSet["msg-valid-2"] {
 		t.Errorf("expected msg-valid-2 to be ACKed")
 	}
-	if ackedSet["msg-bad"] {
-		t.Errorf("expected msg-bad to NOT be ACKed on failure")
+	if !ackedSet["msg-bad"] {
+		t.Errorf("expected msg-bad to be ACKed because it was quarantined successfully")
 	}
 
 	// Valid events must be in the raw store
@@ -708,5 +650,172 @@ func TestWorker_ConcurrentRaceOnSameEvent_Idempotency(t *testing.T) {
 	done, _ := sharedIdempotency.IsDone(context.Background(), "evt_race_same")
 	if !done {
 		t.Errorf("expected evt_race_same marked done")
+	}
+}
+
+// ── Quarantine tests ─────────────────────────────────────────────────────────
+
+func TestQuarantine_ParserFailure(t *testing.T) {
+	msg := buffer.RawMessage{
+		ID: "msg-bad-parse",
+		Event: models.RawEvent{
+			EventID:    "evt_bad_parse",
+			ReceivedAt: time.Now().UTC().Format(time.RFC3339),
+			Format:     "unknown_format", // causes parsing failure
+			Payload:    "some bad data",
+		},
+	}
+	mockBuf := &mockWorkerBuffer{messages: []buffer.RawMessage{msg}}
+	qStore := quarantine.NewMemoryQuarantineStore()
+
+	// empty engine to simulate parser failure
+	emptyEngine := parsing.NewEngine(parsing.NewRegistry())
+
+	w := NewWorker(
+		mockBuf,
+		buffer.NewMemoryIdempotencyStore(),
+		raw.NewMemoryRawStore(),
+		qStore,
+		detection.NewDetector(),
+		detection.NewDriftDetector(),
+		emptyEngine,
+		normalization.NewNormalizer(),
+		nil, // validator not needed here
+		Config{},
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_ = w.Start(ctx)
+
+	// Quarantine successful → should ACK
+	if len(mockBuf.acked) != 1 {
+		t.Errorf("expected message to be ACKed after quarantine, got %v", mockBuf.acked)
+	}
+
+	// Should be in quarantine store
+	record, exists := qStore.Get("evt_bad_parse")
+	if !exists {
+		t.Fatalf("expected quarantine record to exist")
+	}
+	if record.FailureStage != "parsing" {
+		t.Errorf("expected failure_stage 'parsing', got %q", record.FailureStage)
+	}
+}
+
+type mockFailingValidator struct{}
+
+func (m *mockFailingValidator) Validate(event *models.UniversalEvent) validation.ValidationResult {
+	return validation.ValidationResult{
+		Valid: false,
+		Errors: []validation.ValidationError{
+			{Field: "action", Message: "simulated schema validation failure"},
+		},
+	}
+}
+
+func (m *mockFailingValidator) ValidateBytes(data []byte) validation.ValidationResult {
+	return validation.ValidationResult{Valid: false}
+}
+
+func TestQuarantine_ValidationFailure(t *testing.T) {
+	// Send valid JSON structure but missing required schema fields
+	msg := buffer.RawMessage{
+		ID: "msg-bad-schema",
+		Event: models.RawEvent{
+			EventID:    "evt_bad_schema",
+			ReceivedAt: time.Now().UTC().Format(time.RFC3339),
+			Format:     "json",
+			Payload:    `{"src_ip": "10.0.0.1"}`, // missing timestamp, action, etc.
+		},
+	}
+	mockBuf := &mockWorkerBuffer{messages: []buffer.RawMessage{msg}}
+	qStore := quarantine.NewMemoryQuarantineStore()
+
+	w := NewWorker(
+		mockBuf,
+		buffer.NewMemoryIdempotencyStore(),
+		raw.NewMemoryRawStore(),
+		qStore,
+		detection.NewDetector(),
+		detection.NewDriftDetector(),
+		buildParserEngine(), // real parsers
+		normalization.NewNormalizer(),
+		&mockFailingValidator{},
+		Config{},
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_ = w.Start(ctx)
+
+	// Quarantine successful → should ACK
+	if len(mockBuf.acked) != 1 {
+		t.Errorf("expected message to be ACKed after quarantine, got %v", mockBuf.acked)
+	}
+
+	record, exists := qStore.Get("evt_bad_schema")
+	if !exists {
+		t.Fatalf("expected quarantine record to exist")
+	}
+	if record.FailureStage != "validation" {
+		t.Errorf("expected failure_stage 'validation', got %q", record.FailureStage)
+	}
+	if len(record.ValidationErrors) == 0 {
+		t.Errorf("expected validation errors to be captured")
+	}
+	if record.PartialEvent == nil {
+		t.Errorf("expected partial event to be captured")
+	}
+}
+
+// mockFailingQuarantineStore returns an error on Put.
+type mockFailingQuarantineStore struct{}
+
+func (m *mockFailingQuarantineStore) Put(ctx context.Context, record *models.QuarantineRecord) error {
+	return fmt.Errorf("simulated quarantine storage failure")
+}
+
+func TestQuarantine_StorageFailureReleasesLockAndNoACK(t *testing.T) {
+	msg := buffer.RawMessage{
+		ID: "msg-bad-parse2",
+		Event: models.RawEvent{
+			EventID:    "evt_bad_parse2",
+			ReceivedAt: time.Now().UTC().Format(time.RFC3339),
+			Format:     "unknown_format",
+			Payload:    "some bad data",
+		},
+	}
+	mockBuf := &mockWorkerBuffer{messages: []buffer.RawMessage{msg}}
+	qStore := &mockFailingQuarantineStore{}
+	idempotency := newMockIdempotencyStore()
+
+	emptyEngine := parsing.NewEngine(parsing.NewRegistry())
+
+	w := NewWorker(
+		mockBuf,
+		idempotency,
+		raw.NewMemoryRawStore(),
+		qStore,
+		detection.NewDetector(),
+		detection.NewDriftDetector(),
+		emptyEngine,
+		normalization.NewNormalizer(),
+		nil,
+		Config{},
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_ = w.Start(ctx)
+
+	// Quarantine fails → NO ACK
+	if len(mockBuf.acked) != 0 {
+		t.Errorf("expected NO ACK when quarantine fails, got %v", mockBuf.acked)
+	}
+
+	// Lock released for retry
+	if len(idempotency.releasedKeys) == 0 || idempotency.releasedKeys[0] != "evt_bad_parse2" {
+		t.Errorf("expected lock released, got %v", idempotency.releasedKeys)
 	}
 }

@@ -14,6 +14,7 @@ import (
 	"github.com/Krishiv-Mahajan/LogMorph/internal/normalization"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/parsing"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/parsing/parsers"
+	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/quarantine"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/storage/raw"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/validation"
 	"github.com/Krishiv-Mahajan/LogMorph/internal/worker"
@@ -126,6 +127,26 @@ func main() {
 	}
 	defer rawStore.Close()
 
+	// 2.5 Quarantine Store
+	ctxQMinio, cancelQMinio := context.WithTimeout(context.Background(), 5*time.Second)
+	var qStore quarantine.Store
+	minioQStore, err := quarantine.NewMinIOQuarantineStore(ctxQMinio, quarantine.MinIOConfig{
+		Endpoint:        minioEndpoint,
+		AccessKeyID:     minioAccessKey,
+		SecretAccessKey: minioSecretKey,
+		BucketName:      "quarantine-events",
+		UseSSL:          minioUseSSL,
+	})
+	cancelQMinio()
+
+	if err != nil {
+		log.Printf("[Worker] Warning: MinIO unavailable for quarantine (%v). Using in-memory fallback.", err)
+		qStore = quarantine.NewMemoryQuarantineStore()
+	} else {
+		log.Printf("[Worker] Connected to MinIO quarantine store (bucket: quarantine-events)")
+		qStore = minioQStore
+	}
+
 	// 3. Detection & Drift
 	detector := detection.NewDetector()
 	driftDetector := detection.NewDriftDetector()
@@ -151,6 +172,7 @@ func main() {
 		rawBuffer,
 		idempotencyStore,
 		rawStore,
+		qStore,
 		detector,
 		driftDetector,
 		parserEngine,
